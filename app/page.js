@@ -232,8 +232,14 @@ export default function CanvasWhiteboard() {
           { name: 'se', x: screenPos.x + cardW, y: screenPos.y + cardH },
           { name: 'sw', x: screenPos.x, y: screenPos.y + cardH },
         ];
+        const edges = [
+          { name: 'n', x: screenPos.x + cardW / 2, y: screenPos.y },
+          { name: 'e', x: screenPos.x + cardW, y: screenPos.y + cardH / 2 },
+          { name: 's', x: screenPos.x + cardW / 2, y: screenPos.y + cardH },
+          { name: 'w', x: screenPos.x, y: screenPos.y + cardH / 2 },
+        ];
         ctx.fillStyle = '#3b82f6';
-        corners.forEach(c => {
+        [...corners, ...edges].forEach(c => {
           ctx.fillRect(c.x - hs / 2, c.y - hs / 2, hs, hs);
         });
       }
@@ -318,6 +324,10 @@ export default function CanvasWhiteboard() {
         { name: 'ne', x: sp.x + cardW, y: sp.y },
         { name: 'se', x: sp.x + cardW, y: sp.y + cardH },
         { name: 'sw', x: sp.x, y: sp.y + cardH },
+        { name: 'n', x: sp.x + cardW / 2, y: sp.y },
+        { name: 'e', x: sp.x + cardW, y: sp.y + cardH / 2 },
+        { name: 's', x: sp.x + cardW / 2, y: sp.y + cardH },
+        { name: 'w', x: sp.x, y: sp.y + cardH / 2 },
       ];
       for (const h of handles) {
         if (mouseX >= h.x - hs && mouseX <= h.x + hs && mouseY >= h.y - hs && mouseY <= h.y + hs) {
@@ -400,14 +410,24 @@ export default function CanvasWhiteboard() {
           x = initRect.x + dx;
           width = initRect.width - dx;
           height = initRect.height + dy;
+        } else if (handle === 'n') {
+          y = initRect.y + dy;
+          height = initRect.height - dy;
+        } else if (handle === 's') {
+          height = initRect.height + dy;
+        } else if (handle === 'e') {
+          width = initRect.width + dx;
+        } else if (handle === 'w') {
+          x = initRect.x + dx;
+          width = initRect.width - dx;
         }
         width = Math.max(minW, width);
         height = Math.max(minH, height);
         // 防止反向拖动时 x/y 超出
-        if (handle === 'nw' || handle === 'sw') {
+        if (handle === 'nw' || handle === 'sw' || handle === 'w') {
           x = Math.min(x, initRect.x + initRect.width - minW);
         }
-        if (handle === 'nw' || handle === 'ne') {
+        if (handle === 'nw' || handle === 'ne' || handle === 'n') {
           y = Math.min(y, initRect.y + initRect.height - minH);
         }
         return { ...card, x, y, width, height };
@@ -447,6 +467,10 @@ export default function CanvasWhiteboard() {
           { name: 'ne', x: sp.x + cardW, y: sp.y },
           { name: 'se', x: sp.x + cardW, y: sp.y + cardH },
           { name: 'sw', x: sp.x, y: sp.y + cardH },
+          { name: 'n', x: sp.x + cardW / 2, y: sp.y },
+          { name: 'e', x: sp.x + cardW, y: sp.y + cardH / 2 },
+          { name: 's', x: sp.x + cardW / 2, y: sp.y + cardH },
+          { name: 'w', x: sp.x, y: sp.y + cardH / 2 },
         ];
         for (const h of handles) {
           if (mouseX >= h.x - hs && mouseX <= h.x + hs && mouseY >= h.y - hs && mouseY <= h.y + hs) {
@@ -698,11 +722,17 @@ export default function CanvasWhiteboard() {
     if (isSpacePressed) return 'grab';
     if (draggedCard) return 'grabbing';
     if (resizing) {
-      const map = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize' };
+      const map = {
+        nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+        n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize'
+      };
       return map[resizing.handle] || 'default';
     }
     if (hoveredHandle) {
-      const map = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize' };
+      const map = {
+        nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+        n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize'
+      };
       return map[hoveredHandle] || 'default';
     }
     return 'default';
