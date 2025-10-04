@@ -22,6 +22,7 @@ export default function CanvasWhiteboard() {
   const [hoveredCardId, setHoveredCardId] = useState(null);
   const [hoveredHandle, setHoveredHandle] = useState(null); // 'nw'|'ne'|'se'|'sw'|null
   const [resizing, setResizing] = useState(null); // { id, handle, startCanvas, initRect }
+  const [selectedCardId, setSelectedCardId] = useState(null);
 
   // 将屏幕坐标转换为画布坐标
   const screenToCanvas = (screenX, screenY) => {
@@ -105,7 +106,12 @@ export default function CanvasWhiteboard() {
     if (!canvas) return;
 
     const ctx = canvas.getContext('2d');
+    const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    // 重置并清空（用设备像素尺寸）
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // 将坐标系缩放到 CSS 像素，提高清晰度
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // 绘制背景
     ctx.fillStyle = '#f0f0f0';
@@ -193,7 +199,8 @@ export default function CanvasWhiteboard() {
 
         for (let i = startLine; i < lines.length; i++) {
           if (y > screenPos.y + cardH - padding) break;
-          ctx.fillText(lines[i], x, y);
+          // 对齐到整数像素，减少缩小时文字模糊
+          ctx.fillText(lines[i], Math.round(x), Math.round(y));
           y += lineHeight;
         }
 
@@ -223,7 +230,7 @@ export default function CanvasWhiteboard() {
       ctx.strokeRect(screenPos.x, screenPos.y, cardW, cardH);
 
       // 交互手柄（悬停或拖动/缩放时显示）
-      const showHandles = hoveredCardId === card.id || (draggedCard && draggedCard.id === card.id) || (resizing && resizing.id === card.id);
+      const showHandles = selectedCardId === card.id || hoveredCardId === card.id || (draggedCard && draggedCard.id === card.id) || (resizing && resizing.id === card.id);
       if (showHandles) {
         const hs = 8; // 句柄渲染像素尺寸（屏幕坐标）
         const corners = [
@@ -306,7 +313,12 @@ export default function CanvasWhiteboard() {
     // 如果按住空格键，开始拖拽白板
     if (isSpacePressed) {
       setIsPanning(true);
-      setPanStart({ x: mouseX - offset.x, y: mouseY - offset.y });
+      // 记录锚点（世界坐标）
+      const anchorCanvas = screenToCanvas(mouseX, mouseY);
+      setPanStart({ x: anchorCanvas.x, y: anchorCanvas.y });
+      // 初始化最后指针位置
+      pointerStateRef.current.x = mouseX;
+      pointerStateRef.current.y = mouseY;
       return;
     }
 
@@ -337,6 +349,7 @@ export default function CanvasWhiteboard() {
             startCanvas: { x: canvasPos.x, y: canvasPos.y },
             initRect: { x: card.x, y: card.y, width: card.width, height: card.height }
           });
+          setSelectedCardId(card.id);
           return;
         }
       }
@@ -354,8 +367,22 @@ export default function CanvasWhiteboard() {
           x: canvasPos.x - card.x,
           y: canvasPos.y - card.y
         });
+        setSelectedCardId(card.id);
         break;
       }
+    }
+
+    // 点击在空白区域则清除选中
+    if (!draggedCard && !resizing) {
+      let clickedAny = false;
+      for (let i = cards.length - 1; i >= 0; i--) {
+        const c = cards[i];
+        if (canvasPos.x >= c.x && canvasPos.x <= c.x + c.width && canvasPos.y >= c.y && canvasPos.y <= c.y + c.height) {
+          clickedAny = true;
+          break;
+        }
+      }
+      if (!clickedAny) setSelectedCardId(null);
     }
   };
 
@@ -373,12 +400,15 @@ export default function CanvasWhiteboard() {
       }
     }
 
-    // 如果正在拖拽白板
+    // 如果正在拖拽白板（锚点式平移：保持按下时的世界点在鼠标下）
     if (isPanning) {
       setOffset({
-        x: mouseX - panStart.x,
-        y: mouseY - panStart.y
+        x: mouseX - panStart.x * scale,
+        y: mouseY - panStart.y * scale
       });
+      // 更新最后指针位置
+      pointerStateRef.current.x = mouseX;
+      pointerStateRef.current.y = mouseY;
       return;
     }
 
@@ -483,10 +513,14 @@ export default function CanvasWhiteboard() {
     }
     setHoveredCardId(hoverId);
     setHoveredHandle(handleName);
+
+    // 更新最后指针位置
+    pointerStateRef.current.x = mouseX;
+    pointerStateRef.current.y = mouseY;
   };
 
   // 处理鼠标松开
-  const handleMouseUp = () => {
+  const handleMouseUp = (e) => {
     setDraggedCard(null);
     setIsPanning(false);
     setResizing(null);
@@ -497,20 +531,26 @@ export default function CanvasWhiteboard() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+    // 取最后一次指针位置作为缩放锚点，若无则退回到当前事件位置
+    let anchorX = pointerStateRef.current.x;
+    let anchorY = pointerStateRef.current.y;
+    const inBounds = anchorX >= 0 && anchorX <= rect.width && anchorY >= 0 && anchorY <= rect.height;
+    if (!inBounds || anchorX === undefined || anchorY === undefined) {
+      anchorX = e.clientX - rect.left;
+      anchorY = e.clientY - rect.top;
+    }
 
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       const canvasPosBefore = {
-        x: (mouseX - offset.x) / scale,
-        y: (mouseY - offset.y) / scale
+        x: (anchorX - offset.x) / scale,
+        y: (anchorY - offset.y) / scale
       };
       const delta = e.deltaY > 0 ? 0.9 : 1.1;
       const newScale = Math.max(0.1, Math.min(5, scale * delta));
       const newOffset = {
-        x: mouseX - canvasPosBefore.x * newScale,
-        y: mouseY - canvasPosBefore.y * newScale
+        x: anchorX - canvasPosBefore.x * newScale,
+        y: anchorY - canvasPosBefore.y * newScale
       };
       setScale(newScale);
       setOffset(newOffset);
@@ -518,7 +558,7 @@ export default function CanvasWhiteboard() {
     }
 
     // 未按 Ctrl/⌘：尝试滚动文本卡片内容
-    const canvasPos = screenToCanvas(mouseX, mouseY);
+    const canvasPos = screenToCanvas(anchorX, anchorY);
     for (let i = cards.length - 1; i >= 0; i--) {
       const card = cards[i];
       if (card.type === 'text' && canvasPos.x >= card.x && canvasPos.x <= card.x + card.width && canvasPos.y >= card.y && canvasPos.y <= card.y + card.height) {
@@ -660,6 +700,18 @@ export default function CanvasWhiteboard() {
         e.preventDefault();
         setIsSpacePressed(true);
       }
+      // 删除选中卡片：Delete 或 Backspace（输入中除外）
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !showInput) {
+        // 若聚焦在可编辑元素，忽略
+        const tgt = e.target;
+        const isEditable = tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable);
+        if (isEditable) return;
+        if (selectedCardId != null) {
+          e.preventDefault();
+          setCards(prev => prev.filter(c => c.id !== selectedCardId));
+          setSelectedCardId(null);
+        }
+      }
     };
 
     const handleKeyUp = (e) => {
@@ -677,7 +729,7 @@ export default function CanvasWhiteboard() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [isSpacePressed, showInput]);
+  }, [isSpacePressed, showInput, selectedCardId]);
 
   // 输入框获得焦点
   useEffect(() => {
@@ -686,14 +738,21 @@ export default function CanvasWhiteboard() {
     }
   }, [showInput]);
 
-  // 初始化 canvas 尺寸
+  // 初始化 canvas 尺寸（HiDPI 适配）
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+      const cssW = window.innerWidth;
+      const cssH = window.innerHeight;
+      // CSS 尺寸
+      canvas.style.width = `${cssW}px`;
+      canvas.style.height = `${cssH}px`;
+      // 设备像素尺寸
+      canvas.width = Math.floor(cssW * dpr);
+      canvas.height = Math.floor(cssH * dpr);
       drawCards();
     };
 
