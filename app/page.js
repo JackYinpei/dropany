@@ -1301,10 +1301,10 @@ export default function CanvasWhiteboard() {
           <ul style={{ margin: 0, paddingLeft: '20px' }}>
             <li>点击空白处粘贴剪贴板（图/文）</li>
             <li>双击空白处手动添加文字卡片</li>
-            <li>拖动卡片移动位置</li>
-            <li>按住空格键拖拽白板</li>
-            <li>Ctrl + 滚轮缩放画布</li>
-            <li>默认多选，支持批量分享图片</li>
+            <li>文字卡片：单击选择，双击复制内容</li>
+            <li>图片卡片：单击选择；分享仅分享图片</li>
+            <li>按住空格键拖拽白板，Ctrl + 滚轮缩放</li>
+            <li>登录后，云端多端实时更新</li>
           </ul>
           {/* 分享按钮仅在折叠状态下展示 */}
         </div>
