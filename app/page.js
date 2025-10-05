@@ -1,9 +1,14 @@
 'use client'
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useLayoutEffect } from 'react';
+const DBG = true;
+const dlog = (...args) => { try { if (DBG) console.log('[WB]', ...args); } catch {} };
+import { useSession, signIn, signOut } from 'next-auth/react';
+import { createBrowserSupabase } from '@/lib/supabaseClient';
 
 export default function CanvasWhiteboard() {
   const canvasRef = useRef(null);
   const pointerStateRef = useRef({ x: 0, y: 0, moved: false });
+  const supabaseRef = useRef(null);
   const [cards, setCards] = useState([]);
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -16,13 +21,19 @@ export default function CanvasWhiteboard() {
   const [inputPosition, setInputPosition] = useState({ x: 0, y: 0 });
   const [inputText, setInputText] = useState('');
   const inputRef = useRef(null);
+  // 始终指向最新的绘制函数，用于异步回调中调用
+  const drawRef = useRef(() => {});
   // 缓存已加载图片，避免重复加载
   const imageCacheRef = useRef(new Map()); // src => HTMLImageElement
   const objectUrlsRef = useRef(new Set()); // 用于卸载时统一 revoke
+  const imageLoadingRef = useRef(new Set()); // 正在加载的 storage 路径，避免重复请求
   const [hoveredCardId, setHoveredCardId] = useState(null);
   const [hoveredHandle, setHoveredHandle] = useState(null); // 'nw'|'ne'|'se'|'sw'|null
   const [resizing, setResizing] = useState(null); // { id, handle, startCanvas, initRect }
   const [selectedCardId, setSelectedCardId] = useState(null);
+  const { data: session, status } = useSession();
+  const userId = session?.user?.id || null;
+  const saveTimersRef = useRef(new Map()); // id -> timeout
 
   // 将屏幕坐标转换为画布坐标
   const screenToCanvas = (screenX, screenY) => {
@@ -113,9 +124,13 @@ export default function CanvasWhiteboard() {
     // 将坐标系缩放到 CSS 像素，提高清晰度
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+    const cssW = canvas.width / dpr;
+    const cssH = canvas.height / dpr;
+    dlog('draw start', { cards: cards.length, scale, offset, dpr, canvasW: canvas.width, canvasH: canvas.height, cssW, cssH });
+
     // 绘制背景
     ctx.fillStyle = '#f0f0f0';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, cssW, cssH);
 
     // 绘制网格
     ctx.strokeStyle = '#e0e0e0';
@@ -124,17 +139,17 @@ export default function CanvasWhiteboard() {
     const startX = offset.x % gridSize;
     const startY = offset.y % gridSize;
 
-    for (let x = startX; x < canvas.width; x += gridSize) {
+    for (let x = startX; x < cssW; x += gridSize) {
       ctx.beginPath();
       ctx.moveTo(x, 0);
-      ctx.lineTo(x, canvas.height);
+      ctx.lineTo(x, cssH);
       ctx.stroke();
     }
 
-    for (let y = startY; y < canvas.height; y += gridSize) {
+    for (let y = startY; y < cssH; y += gridSize) {
       ctx.beginPath();
       ctx.moveTo(0, y);
-      ctx.lineTo(canvas.width, y);
+      ctx.lineTo(cssW, y);
       ctx.stroke();
     }
 
@@ -143,6 +158,7 @@ export default function CanvasWhiteboard() {
       const screenPos = canvasToScreen(card.x, card.y);
       const cardW = card.width * scale;
       const cardH = card.height * scale;
+      dlog('draw card', { id: card.id, type: card.type, screenPos, cardW, cardH });
 
       // 卡片阴影
       ctx.shadowColor = 'rgba(0, 0, 0, 0.2)';
@@ -163,8 +179,44 @@ export default function CanvasWhiteboard() {
       if (card.type === 'image') {
         const img = imageCacheRef.current.get(card.src);
         if (img) {
+          dlog('image cache hit', card.src);
           ctx.drawImage(img, screenPos.x, screenPos.y, cardW, cardH);
         } else {
+          dlog('image cache miss -> signed URL', card.src);
+          // 如果是登录态（存的是 storage 路径），尝试触发签名 URL 加载
+          if (userId && supabaseRef.current && !imageLoadingRef.current.has(card.src)) {
+            // 异步加载，不阻塞绘制
+            (async () => {
+              try {
+                imageLoadingRef.current.add(card.src);
+                const { data, error } = await supabaseRef.current.storage.from('cards').createSignedUrl(card.src, 86400);
+                if (!error && data?.signedUrl) {
+                  dlog('signed url ok', { src: card.src });
+                  const url = data.signedUrl;
+                  const imgEl = new Image();
+                  imgEl.crossOrigin = 'anonymous';
+                  imgEl.onload = () => {
+                    dlog('image onload', { src: card.src });
+                    imageCacheRef.current.set(card.src, imgEl);
+                    imageLoadingRef.current.delete(card.src);
+                    // 使用最新的绘制函数，避免陈旧闭包清空画布
+                    if (drawRef.current) drawRef.current();
+                  };
+                  imgEl.onerror = () => {
+                    dlog('image onerror', { src: card.src });
+                    imageLoadingRef.current.delete(card.src);
+                  };
+                  imgEl.src = url;
+                } else {
+                  dlog('signed url error', { src: card.src, error });
+                  imageLoadingRef.current.delete(card.src);
+                }
+              } catch {
+                dlog('signed url exception', { src: card.src });
+                imageLoadingRef.current.delete(card.src);
+              }
+            })();
+          }
           // 占位符
           ctx.fillStyle = '#f5f5f5';
           ctx.fillRect(screenPos.x, screenPos.y, cardW, cardH);
@@ -225,7 +277,7 @@ export default function CanvasWhiteboard() {
       }
 
       // 卡片边框
-      ctx.strokeStyle = '#3b82f6';
+      ctx.strokeStyle = selectedCardId === card.id ? '#2563eb' : '#3b82f6';
       ctx.lineWidth = 2;
       ctx.strokeRect(screenPos.x, screenPos.y, cardW, cardH);
 
@@ -251,7 +303,13 @@ export default function CanvasWhiteboard() {
         });
       }
     });
+    dlog('draw end');
   };
+
+  // 保持 drawRef 指向最新的 drawCards，供异步回调安全调用
+  useLayoutEffect(() => {
+    drawRef.current = drawCards;
+  });
 
   // 处理画布双击
   const handleCanvasDoubleClick = (e) => {
@@ -291,6 +349,10 @@ export default function CanvasWhiteboard() {
         height: 100
       };
       setCards([...cards, newCard]);
+      // 持久化
+      if (userId && supabaseRef.current) {
+        scheduleSave(newCard);
+      }
     }
     setShowInput(false);
     setInputText('');
@@ -421,62 +483,58 @@ export default function CanvasWhiteboard() {
       const minH = 60;
       const dx = canvasPos.x - resizing.startCanvas.x;
       const dy = canvasPos.y - resizing.startCanvas.y;
-      setCards(cards.map(card => {
-        if (card.id !== id) return card;
-        let { x, y, width, height } = initRect;
-        if (handle === 'nw') {
-          x = initRect.x + dx;
-          y = initRect.y + dy;
-          width = initRect.width - dx;
-          height = initRect.height - dy;
-        } else if (handle === 'ne') {
-          y = initRect.y + dy;
-          width = initRect.width + dx;
-          height = initRect.height - dy;
-        } else if (handle === 'se') {
-          width = initRect.width + dx;
-          height = initRect.height + dy;
-        } else if (handle === 'sw') {
-          x = initRect.x + dx;
-          width = initRect.width - dx;
-          height = initRect.height + dy;
-        } else if (handle === 'n') {
-          y = initRect.y + dy;
-          height = initRect.height - dy;
-        } else if (handle === 's') {
-          height = initRect.height + dy;
-        } else if (handle === 'e') {
-          width = initRect.width + dx;
-        } else if (handle === 'w') {
-          x = initRect.x + dx;
-          width = initRect.width - dx;
-        }
-        width = Math.max(minW, width);
-        height = Math.max(minH, height);
-        // 防止反向拖动时 x/y 超出
-        if (handle === 'nw' || handle === 'sw' || handle === 'w') {
-          x = Math.min(x, initRect.x + initRect.width - minW);
-        }
-        if (handle === 'nw' || handle === 'ne' || handle === 'n') {
-          y = Math.min(y, initRect.y + initRect.height - minH);
-        }
-        return { ...card, x, y, width, height };
-      }));
+      // 预先计算，便于本地与持久化共用
+      let nx = initRect.x, ny = initRect.y, nw = initRect.width, nh = initRect.height;
+      if (handle === 'nw') {
+        nx = initRect.x + dx;
+        ny = initRect.y + dy;
+        nw = initRect.width - dx;
+        nh = initRect.height - dy;
+      } else if (handle === 'ne') {
+        ny = initRect.y + dy;
+        nw = initRect.width + dx;
+        nh = initRect.height - dy;
+      } else if (handle === 'se') {
+        nw = initRect.width + dx;
+        nh = initRect.height + dy;
+      } else if (handle === 'sw') {
+        nx = initRect.x + dx;
+        nw = initRect.width - dx;
+        nh = initRect.height + dy;
+      } else if (handle === 'n') {
+        ny = initRect.y + dy;
+        nh = initRect.height - dy;
+      } else if (handle === 's') {
+        nh = initRect.height + dy;
+      } else if (handle === 'e') {
+        nw = initRect.width + dx;
+      } else if (handle === 'w') {
+        nx = initRect.x + dx;
+        nw = initRect.width - dx;
+      }
+      nw = Math.max(minW, nw);
+      nh = Math.max(minH, nh);
+      if (handle === 'nw' || handle === 'sw' || handle === 'w') {
+        nx = Math.min(nx, initRect.x + initRect.width - minW);
+      }
+      if (handle === 'nw' || handle === 'ne' || handle === 'n') {
+        ny = Math.min(ny, initRect.y + initRect.height - minH);
+      }
+      const updated = { ...cards.find(c => c.id === id), x: nx, y: ny, width: nw, height: nh };
+      setCards(cards.map(card => (card.id === id ? updated : card)));
+      if (userId && supabaseRef.current) scheduleSave(updated);
       return;
     }
 
     // 如果正在拖拽卡片
     if (draggedCard) {
-      setCards(cards.map(card => {
-        if (card.id === draggedCard.id) {
-          return {
-            ...card,
-            x: canvasPos.x - dragOffset.x,
-            y: canvasPos.y - dragOffset.y
-          };
-        }
-        return card;
-      }));
+      const updated = {
+        ...draggedCard,
+        x: canvasPos.x - dragOffset.x,
+        y: canvasPos.y - dragOffset.y,
+      };
+      setCards(cards.map(card => (card.id === draggedCard.id ? updated : card)));
+      if (userId && supabaseRef.current) scheduleSave(updated);
       return;
     }
 
@@ -528,6 +586,7 @@ export default function CanvasWhiteboard() {
 
   // 处理滚轮缩放
   const handleWheel = useCallback((e) => {
+    dlog('wheel event', { ctrl: e.ctrlKey || e.metaKey, deltaY: e.deltaY });
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -554,6 +613,7 @@ export default function CanvasWhiteboard() {
       };
       setScale(newScale);
       setOffset(newOffset);
+      dlog('zoom apply', { newScale, newOffset });
       return;
     }
 
@@ -573,12 +633,14 @@ export default function CanvasWhiteboard() {
           e.preventDefault();
           const maxScroll = contentHeight - viewportH;
           const next = Math.max(0, Math.min((card.scrollY || 0) + e.deltaY, maxScroll));
-          setCards(cards.map(c => c.id === card.id ? { ...c, scrollY: next } : c));
+          const updated = { ...card, scrollY: next };
+          setCards(cards.map(c => c.id === card.id ? updated : c));
+          if (userId && supabaseRef.current) scheduleSave(updated);
         }
         break;
       }
     }
-  }, [scale, offset, cards]);
+  }, [scale, offset, cards, userId]);
 
   const handleCanvasClick = async (e) => {
     if (e.detail > 1 || isPanning || isSpacePressed || showInput) return;
@@ -614,46 +676,69 @@ export default function CanvasWhiteboard() {
           const imageType = item.types.find(t => t.startsWith('image/'));
           if (imageType) {
             const blob = await item.getType(imageType);
-            // 加载图片并创建卡片
-            await new Promise((resolve, reject) => {
+            dlog('clipboard image found', { imageType });
+            // 优先用本地解码获取尺寸，避免依赖网络图片加载
+            let w = 0, h = 0;
+            try {
+              if (typeof createImageBitmap === 'function') {
+                const bmp = await createImageBitmap(blob);
+                w = bmp.width; h = bmp.height;
+              } else {
+                // 兼容：用 objectURL + Image 读取尺寸
+                const tmpUrl = URL.createObjectURL(blob);
+                await new Promise((resolve, reject) => {
+                  const img = new Image();
+                  img.onload = () => { w = img.width; h = img.height; URL.revokeObjectURL(tmpUrl); resolve(); };
+                  img.onerror = (e) => { URL.revokeObjectURL(tmpUrl); reject(e); };
+                  img.src = tmpUrl;
+                });
+              }
+            } catch (e) {
+              // 尺寸读取失败则给个默认
+              w = 200; h = 150;
+            }
+            // 按较长边等比缩放到 400
+            const maxDim = 400;
+            if (w > h && w > maxDim) { const s = maxDim / w; w = Math.round(w * s); h = Math.round(h * s); }
+            else if (h >= w && h > maxDim) { const s = maxDim / h; w = Math.round(w * s); h = Math.round(h * s); }
+
+            // 若已登录则上传 Supabase Storage，否则走本地 objectURL
+            if (userId && supabaseRef.current) {
+              const ext = imageType.split('/')[1] || 'png';
+              const filePath = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+              const { error: upErr } = await supabaseRef.current.storage.from('cards').upload(filePath, blob, { upsert: true, contentType: imageType });
+              if (upErr) throw upErr;
+              dlog('storage upload ok', { filePath });
+              // 本地立即缓存以便绘制（避免依赖远程图片加载）
+              try {
+                const tmpUrl = URL.createObjectURL(blob);
+                const img = new Image();
+                img.onload = () => {
+                  imageCacheRef.current.set(filePath, img);
+                  objectUrlsRef.current.add(tmpUrl);
+                  if (drawRef.current) drawRef.current();
+                };
+                img.onerror = () => { URL.revokeObjectURL(tmpUrl); };
+                img.src = tmpUrl;
+              } catch {}
+              const newCard = { id: Date.now(), type: 'image', src: filePath, x: canvasPos.x, y: canvasPos.y, width: w, height: h };
+              setCards(prev => [...prev, newCard]);
+              scheduleSave(newCard);
+            } else {
               const url = URL.createObjectURL(blob);
               const img = new Image();
-              img.onload = () => {
-                // 统一缩放到最大边不超过 400 像素
-                const maxDim = 400;
-                let w = img.width;
-                let h = img.height;
-                if (w > h && w > maxDim) {
-                  const s = maxDim / w;
-                  w = Math.round(w * s);
-                  h = Math.round(h * s);
-                } else if (h >= w && h > maxDim) {
-                  const s = maxDim / h;
-                  w = Math.round(w * s);
-                  h = Math.round(h * s);
-                }
-
+              try {
+                await new Promise((resolve, reject) => {
+                  img.onload = resolve;
+                  img.onerror = reject;
+                  img.src = url;
+                });
                 imageCacheRef.current.set(url, img);
                 objectUrlsRef.current.add(url);
-
-                const newCard = {
-                  id: Date.now(),
-                  type: 'image',
-                  src: url,
-                  x: canvasPos.x,
-                  y: canvasPos.y,
-                  width: w,
-                  height: h
-                };
-                setCards(prev => [...prev, newCard]);
-                resolve();
-              };
-              img.onerror = (ev) => {
-                URL.revokeObjectURL(url);
-                reject(ev);
-              };
-              img.src = url;
-            });
+              } catch {}
+              const newCard = { id: Date.now(), type: 'image', src: url, x: canvasPos.x, y: canvasPos.y, width: w, height: h };
+              setCards(prev => [...prev, newCard]);
+            }
             added = true;
             break;
           }
@@ -675,21 +760,24 @@ export default function CanvasWhiteboard() {
           height: 100
         };
         setCards(prev => [...prev, newCard]);
+        if (userId && supabaseRef.current) scheduleSave(newCard);
       }
     } catch (err) {
       console.error('读取剪贴板失败', err);
     }
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const listener = (event) => handleWheel(event);
     canvas.addEventListener('wheel', listener, { passive: false });
+    dlog('wheel listener attached');
 
     return () => {
       canvas.removeEventListener('wheel', listener);
+      dlog('wheel listener removed');
     };
   }, [handleWheel]);
 
@@ -709,6 +797,10 @@ export default function CanvasWhiteboard() {
         if (selectedCardId != null) {
           e.preventDefault();
           setCards(prev => prev.filter(c => c.id !== selectedCardId));
+          // 删除远端
+          if (userId && supabaseRef.current) {
+            supabaseRef.current.from('cards').delete().match({ id: String(selectedCardId), user_id: userId }).then(() => {});
+          }
           setSelectedCardId(null);
         }
       }
@@ -729,7 +821,7 @@ export default function CanvasWhiteboard() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [isSpacePressed, showInput, selectedCardId]);
+  }, [isSpacePressed, showInput, selectedCardId, userId]);
 
   // 输入框获得焦点
   useEffect(() => {
@@ -739,7 +831,7 @@ export default function CanvasWhiteboard() {
   }, [showInput]);
 
   // 初始化 canvas 尺寸（HiDPI 适配）
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -753,18 +845,32 @@ export default function CanvasWhiteboard() {
       // 设备像素尺寸
       canvas.width = Math.floor(cssW * dpr);
       canvas.height = Math.floor(cssH * dpr);
+      dlog('resize', { cssW, cssH, dpr, width: canvas.width, height: canvas.height });
       drawCards();
     };
 
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
-  }, []);
+  }, [cards, scale, offset]);
 
   // 重绘画布
-  useEffect(() => {
+  useLayoutEffect(() => {
+    dlog('layout redraw', { cards: cards.length, scale, offset });
     drawCards();
   }, [cards, scale, offset]);
+
+  // 观察 cards 变化
+  useEffect(() => {
+    dlog('cards changed', cards.map(c => ({ id: c.id, type: c.type })));
+  }, [cards]);
+
+  // 页面可见性变化时强制重绘，避免偶发的首帧被清空
+  useEffect(() => {
+    const onVis = () => { if (drawRef.current) drawRef.current(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
 
   // 卸载时释放创建的 objectURL
   useEffect(() => {
@@ -774,6 +880,153 @@ export default function CanvasWhiteboard() {
       imageCacheRef.current.clear();
     };
   }, []);
+
+  // 建立 Supabase 连接与实时同步
+  useEffect(() => {
+    let channel;
+    const setup = async () => {
+      if (!userId || !session?.supabaseAccessToken || !session?.supabaseRefreshToken) return;
+      const supabase = createBrowserSupabase();
+      const { data, error } = await supabase.auth.setSession({
+        access_token: session.supabaseAccessToken,
+        refresh_token: session.supabaseRefreshToken,
+      });
+      if (error) {
+        console.error('Supabase setSession error', error);
+        return;
+      }
+      dlog('supabase setSession ok');
+      supabaseRef.current = supabase;
+      // 拉取初始数据
+      const { data: rows, error: qerr } = await supabase
+        .from('cards')
+        .select('*')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: true });
+      dlog('initial query finished', { error: qerr ? qerr.message : null });
+      if (!qerr && Array.isArray(rows)) {
+        const list = rows.map(r => fromRow(r));
+        dlog('initial fetch ok', { count: list.length });
+        setCards(list);
+        // 预加载图片（私有桶：使用签名 URL）
+        for (const c of list) {
+          if (c.type === 'image' && c.src && !imageCacheRef.current.get(c.src)) {
+            try {
+              imageLoadingRef.current.add(c.src);
+              const { data, error } = await supabase.storage.from('cards').createSignedUrl(c.src, 86400);
+              if (!error && data?.signedUrl) {
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                img.onload = () => {
+                  imageCacheRef.current.set(c.src, img);
+                  imageLoadingRef.current.delete(c.src);
+                  if (drawRef.current) drawRef.current();
+                };
+                img.onerror = () => { imageLoadingRef.current.delete(c.src); };
+                img.src = data.signedUrl;
+              } else {
+                imageLoadingRef.current.delete(c.src);
+              }
+            } catch {
+              imageLoadingRef.current.delete(c.src);
+            }
+          }
+        }
+      } else if (qerr) {
+        console.error('Load cards error', qerr);
+      }
+
+      // 订阅实时变更
+      channel = supabase
+        .channel('cards:user:' + userId)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'cards', filter: `user_id=eq.${userId}` }, (payload) => {
+          const row = payload.new || payload.old;
+          const id = row?.id;
+          if (!id) return;
+          if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+            const card = fromRow(payload.new);
+            dlog('realtime upsert', { id: card.id, type: card.type });
+            setCards(prev => {
+              const exists = prev.some(c => String(c.id) === String(card.id));
+              if (exists) return prev.map(c => (String(c.id) === String(card.id) ? card : c));
+              return [...prev, card];
+            });
+            // 由依赖 cards 的布局效果触发重绘
+            if (card.type === 'image' && card.src && !imageCacheRef.current.get(card.src)) {
+              (async () => {
+                try {
+                  imageLoadingRef.current.add(card.src);
+                  const { data, error } = await supabase.storage.from('cards').createSignedUrl(card.src, 86400);
+                  if (!error && data?.signedUrl) {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => { imageCacheRef.current.set(card.src, img); imageLoadingRef.current.delete(card.src); if (drawRef.current) drawRef.current(); };
+                    img.onerror = () => { imageLoadingRef.current.delete(card.src); };
+                    img.src = data.signedUrl;
+                  } else {
+                    imageLoadingRef.current.delete(card.src);
+                  }
+                } catch {
+                  imageLoadingRef.current.delete(card.src);
+                }
+              })();
+            }
+          } else if (payload.eventType === 'DELETE') {
+            dlog('realtime delete', { id });
+            setCards(prev => prev.filter(c => String(c.id) !== String(id)));
+          }
+        })
+        .subscribe();
+    };
+    setup();
+    return () => {
+      if (channel && supabaseRef.current) {
+        supabaseRef.current.removeChannel(channel);
+      }
+    };
+  }, [userId, session?.supabaseAccessToken, session?.supabaseRefreshToken]);
+
+  // 工具：保存卡片（去抖）与转换
+  const toRow = (card) => ({
+    id: String(card.id),
+    user_id: userId,
+    type: card.type,
+    text: card.text || null,
+    src: card.src || null,
+    x: card.x,
+    y: card.y,
+    width: card.width,
+    height: card.height,
+    scroll_y: card.scrollY || 0,
+  });
+  const fromRow = (r) => ({
+    id: /^(\d+)$/.test(r.id) ? Number(r.id) : r.id,
+    type: r.type,
+    text: r.text || '',
+    src: r.src || null, // 存储路径，如 <uid>/file.ext
+    x: r.x,
+    y: r.y,
+    width: r.width,
+    height: r.height,
+    scrollY: r.scroll_y || 0,
+  });
+
+  const scheduleSave = (card) => {
+    if (!userId || !supabaseRef.current) return;
+    const id = String(card.id);
+    const key = id;
+    const timers = saveTimersRef.current;
+    if (timers.has(key)) clearTimeout(timers.get(key));
+    const t = setTimeout(async () => {
+      try {
+        dlog('upsert card', { id: card.id, type: card.type });
+        await supabaseRef.current.from('cards').upsert([toRow(card)], { onConflict: 'id' });
+      } catch (e) {
+        console.error('save card error', e);
+      }
+    }, 300);
+    timers.set(key, t);
+  };
 
   // 获取光标样式
   const getCursor = () => {
@@ -904,7 +1157,7 @@ export default function CanvasWhiteboard() {
         缩放: {(scale * 100).toFixed(0)}%
       </div>
 
-      {/* 使用说明 */}
+      {/* 使用说明 / 用户状态 */}
       <div style={{
         position: 'absolute',
         top: '20px',
@@ -916,13 +1169,26 @@ export default function CanvasWhiteboard() {
         fontSize: '14px',
         maxWidth: '300px'
       }}>
-        <h3 style={{ margin: '0 0 12px 0', fontSize: '16px' }}>使用说明</h3>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+          <h3 style={{ margin: 0, fontSize: '16px' }}>使用说明</h3>
+          <div>
+            {status === 'authenticated' ? (
+              <>
+                <span style={{ marginRight: 8, color: '#374151' }}>{session?.user?.email}</span>
+                <button onClick={() => signOut()} style={{ padding: '4px 8px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fff', cursor: 'pointer' }}>退出</button>
+              </>
+            ) : (
+              <a href="/login" style={{ color: '#2563eb' }}>登录</a>
+            )}
+          </div>
+        </div>
         <ul style={{ margin: 0, paddingLeft: '20px' }}>
           <li>点击空白处粘贴剪贴板（图/文）</li>
           <li>双击空白处手动添加文字卡片</li>
           <li>拖动卡片移动位置</li>
           <li>按住空格键拖拽白板</li>
           <li>Ctrl + 滚轮缩放画布</li>
+          <li>登录后，卡片会实时保存在云端</li>
         </ul>
       </div>
     </div>
