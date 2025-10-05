@@ -1,7 +1,5 @@
 'use client'
 import React, { useRef, useEffect, useState, useCallback, useLayoutEffect } from 'react';
-const DBG = true;
-const dlog = (...args) => { try { if (DBG) console.log('[WB]', ...args); } catch {} };
 import { useSession, signIn, signOut } from 'next-auth/react';
 import { createBrowserSupabase } from '@/lib/supabaseClient';
 
@@ -10,6 +8,7 @@ export default function CanvasWhiteboard() {
   const pointerStateRef = useRef({ x: 0, y: 0, moved: false });
   const supabaseRef = useRef(null);
   const [cards, setCards] = useState([]);
+  const [hint, setHint] = useState(null); // { x, y, text, tone: 'success'|'info'|'error', fading: bool }
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [draggedCard, setDraggedCard] = useState(null);
@@ -30,10 +29,104 @@ export default function CanvasWhiteboard() {
   const [hoveredCardId, setHoveredCardId] = useState(null);
   const [hoveredHandle, setHoveredHandle] = useState(null); // 'nw'|'ne'|'se'|'sw'|null
   const [resizing, setResizing] = useState(null); // { id, handle, startCanvas, initRect }
-  const [selectedCardId, setSelectedCardId] = useState(null);
+  // 单一主选已移除，统一使用多选集合
+  const [selectedIds, setSelectedIds] = useState(new Set()); // 多选集合（文本与图片均可）
   const { data: session, status } = useSession();
   const userId = session?.user?.id || null;
   const saveTimersRef = useRef(new Map()); // id -> timeout
+  const [isGuideCollapsed, setIsGuideCollapsed] = useState(false); // 使用说明是否折叠
+
+  // 轻提示动画
+  const showHint = useCallback((text, x, y, tone = 'success') => {
+    const pos = { x: Math.max(12, Math.min(x, (typeof window !== 'undefined' ? window.innerWidth - 12 : x))), y: Math.max(12, y - 20) };
+    setHint({ text, x: pos.x, y: pos.y, tone, fading: false });
+    // 触发过渡（稍作停留再淡出）
+    setTimeout(() => {
+      setHint(prev => prev ? { ...prev, fading: true } : prev);
+    }, 120);
+    // 自动消失
+    setTimeout(() => setHint(null), 900);
+  }, []);
+
+  
+
+  // 批量分享已选图片
+  const shareSelected = useCallback(async () => {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.share) {
+        showHint('该设备不支持分享', 24, 24, 'info');
+        return;
+      }
+      const ids = Array.from(selectedIds);
+      if (!ids.length) {
+        showHint('请先选择图片', 24, 24, 'info');
+        return;
+      }
+      const imgs = cards.filter(c => ids.includes(c.id) && c.type === 'image');
+      if (!imgs.length) {
+        showHint('仅支持分享图片', 24, 24, 'info');
+        return;
+      }
+      const blobs = await Promise.all(imgs.map(async (card) => {
+        let blob = null;
+        try {
+          if (userId && supabaseRef.current && card.src && !/^https?:|^blob:|^data:/.test(card.src)) {
+            const { data, error } = await supabaseRef.current.storage.from('cards').createSignedUrl(card.src, 3600);
+            if (!error && data?.signedUrl) {
+              const res = await fetch(data.signedUrl);
+              blob = await res.blob();
+            }
+          }
+          if (!blob && card.src) {
+            try {
+              const res = await fetch(card.src);
+              blob = await res.blob();
+            } catch {}
+          }
+          if (!blob) {
+            const img = imageCacheRef.current.get(card.src);
+            if (img && img.naturalWidth && img.naturalHeight) {
+              const c = document.createElement('canvas');
+              c.width = img.naturalWidth; c.height = img.naturalHeight;
+              const ctx2 = c.getContext('2d');
+              ctx2.drawImage(img, 0, 0);
+              blob = await new Promise(resolve => c.toBlob(b => resolve(b), 'image/png', 0.92));
+            }
+          }
+        } catch {}
+        return blob;
+      }));
+      const files = blobs.filter(Boolean).map((blob, idx) => new File([blob], `image-${idx + 1}.png`, { type: blob.type || 'image/png' }));
+      if (!files.length) {
+        showHint('未能获取到图片数据', 24, 24, 'error');
+        return;
+      }
+      if (navigator.canShare && !navigator.canShare({ files })) {
+        showHint('该设备不支持多图分享', 24, 24, 'info');
+        return;
+      }
+      await navigator.share({ files, title: '分享图片', text: '' });
+    } catch {
+      showHint('分享失败', 24, 24, 'error');
+    }
+  }, [cards, selectedIds, userId, showHint]);
+
+  // 批量删除已选（文本与图片）
+  const deleteSelected = useCallback(async () => {
+    const idsArr = Array.from(selectedIds);
+    if (idsArr.length === 0) {
+      showHint('请先选择要删除的卡片', 24, 24, 'info');
+      return;
+    }
+    const idsSet = new Set(idsArr);
+    setCards(prev => prev.filter(c => !idsSet.has(c.id)));
+    if (userId && supabaseRef.current) {
+      try {
+        await supabaseRef.current.from('cards').delete().in('id', idsArr.map(String)).eq('user_id', userId);
+      } catch {}
+    }
+    setSelectedIds(new Set());
+  }, [selectedIds, userId, showHint]);
 
   // 将屏幕坐标转换为画布坐标
   const screenToCanvas = (screenX, screenY) => {
@@ -126,7 +219,6 @@ export default function CanvasWhiteboard() {
 
     const cssW = canvas.width / dpr;
     const cssH = canvas.height / dpr;
-    dlog('draw start', { cards: cards.length, scale, offset, dpr, canvasW: canvas.width, canvasH: canvas.height, cssW, cssH });
 
     // 绘制背景
     ctx.fillStyle = '#f0f0f0';
@@ -158,7 +250,6 @@ export default function CanvasWhiteboard() {
       const screenPos = canvasToScreen(card.x, card.y);
       const cardW = card.width * scale;
       const cardH = card.height * scale;
-      dlog('draw card', { id: card.id, type: card.type, screenPos, cardW, cardH });
 
       // 卡片阴影
       ctx.shadowColor = 'rgba(0, 0, 0, 0.2)';
@@ -179,10 +270,8 @@ export default function CanvasWhiteboard() {
       if (card.type === 'image') {
         const img = imageCacheRef.current.get(card.src);
         if (img) {
-          dlog('image cache hit', card.src);
           ctx.drawImage(img, screenPos.x, screenPos.y, cardW, cardH);
         } else {
-          dlog('image cache miss -> signed URL', card.src);
           // 如果是登录态（存的是 storage 路径），尝试触发签名 URL 加载
           if (userId && supabaseRef.current && !imageLoadingRef.current.has(card.src)) {
             // 异步加载，不阻塞绘制
@@ -191,28 +280,23 @@ export default function CanvasWhiteboard() {
                 imageLoadingRef.current.add(card.src);
                 const { data, error } = await supabaseRef.current.storage.from('cards').createSignedUrl(card.src, 86400);
                 if (!error && data?.signedUrl) {
-                  dlog('signed url ok', { src: card.src });
                   const url = data.signedUrl;
                   const imgEl = new Image();
                   imgEl.crossOrigin = 'anonymous';
                   imgEl.onload = () => {
-                    dlog('image onload', { src: card.src });
                     imageCacheRef.current.set(card.src, imgEl);
                     imageLoadingRef.current.delete(card.src);
                     // 使用最新的绘制函数，避免陈旧闭包清空画布
                     if (drawRef.current) drawRef.current();
                   };
                   imgEl.onerror = () => {
-                    dlog('image onerror', { src: card.src });
                     imageLoadingRef.current.delete(card.src);
                   };
                   imgEl.src = url;
                 } else {
-                  dlog('signed url error', { src: card.src, error });
                   imageLoadingRef.current.delete(card.src);
                 }
               } catch {
-                dlog('signed url exception', { src: card.src });
                 imageLoadingRef.current.delete(card.src);
               }
             })();
@@ -276,13 +360,14 @@ export default function CanvasWhiteboard() {
         ctx.restore();
       }
 
-      // 卡片边框
-      ctx.strokeStyle = selectedCardId === card.id ? '#2563eb' : '#3b82f6';
+      // 卡片边框（多选或单选高亮）
+      const isSelected = selectedIds.has(card.id);
+      ctx.strokeStyle = isSelected ? '#2563eb' : '#3b82f6';
       ctx.lineWidth = 2;
       ctx.strokeRect(screenPos.x, screenPos.y, cardW, cardH);
 
       // 交互手柄（悬停或拖动/缩放时显示）
-      const showHandles = selectedCardId === card.id || hoveredCardId === card.id || (draggedCard && draggedCard.id === card.id) || (resizing && resizing.id === card.id);
+      const showHandles = selectedIds.has(card.id) || hoveredCardId === card.id || (draggedCard && draggedCard.id === card.id) || (resizing && resizing.id === card.id);
       if (showHandles) {
         const hs = 8; // 句柄渲染像素尺寸（屏幕坐标）
         const corners = [
@@ -303,7 +388,6 @@ export default function CanvasWhiteboard() {
         });
       }
     });
-    dlog('draw end');
   };
 
   // 保持 drawRef 指向最新的 drawCards，供异步回调安全调用
@@ -312,7 +396,7 @@ export default function CanvasWhiteboard() {
   });
 
   // 处理画布双击
-  const handleCanvasDoubleClick = (e) => {
+  const handleCanvasDoubleClick = async (e) => {
     if (isPanning) return;
 
     const rect = canvasRef.current.getBoundingClientRect();
@@ -328,9 +412,19 @@ export default function CanvasWhiteboard() {
         canvasPos.y <= card.y + card.height;
     });
 
-    if (clickedCard) return;
+    if (clickedCard) {
+      if (clickedCard.type === 'text') {
+        try {
+          if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(clickedCard.text || '');
+            showHint('已复制', clickX, clickY, 'success');
+          }
+        } catch {}
+      }
+      return;
+    }
 
-    // 显示输入框
+    // 双击空白：显示输入框
     setInputPosition(canvasPos);
     setInputText('');
     setShowInput(true);
@@ -411,7 +505,6 @@ export default function CanvasWhiteboard() {
             startCanvas: { x: canvasPos.x, y: canvasPos.y },
             initRect: { x: card.x, y: card.y, width: card.width, height: card.height }
           });
-          setSelectedCardId(card.id);
           return;
         }
       }
@@ -429,7 +522,6 @@ export default function CanvasWhiteboard() {
           x: canvasPos.x - card.x,
           y: canvasPos.y - card.y
         });
-        setSelectedCardId(card.id);
         break;
       }
     }
@@ -444,7 +536,7 @@ export default function CanvasWhiteboard() {
           break;
         }
       }
-      if (!clickedAny) setSelectedCardId(null);
+      if (!clickedAny) setSelectedIds(new Set());
     }
   };
 
@@ -586,7 +678,6 @@ export default function CanvasWhiteboard() {
 
   // 处理滚轮缩放
   const handleWheel = useCallback((e) => {
-    dlog('wheel event', { ctrl: e.ctrlKey || e.metaKey, deltaY: e.deltaY });
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -613,7 +704,6 @@ export default function CanvasWhiteboard() {
       };
       setScale(newScale);
       setOffset(newOffset);
-      dlog('zoom apply', { newScale, newOffset });
       return;
     }
 
@@ -663,7 +753,16 @@ export default function CanvasWhiteboard() {
         canvasPos.y <= card.y + card.height;
     });
 
-    if (clickedCard) return;
+    // 点击到卡片：所有类型均切换选中（高亮由选中驱动）
+    if (clickedCard) {
+      setSelectedIds(prev => {
+        const next = new Set(prev);
+        if (next.has(clickedCard.id)) next.delete(clickedCard.id);
+        else next.add(clickedCard.id);
+        return next;
+      });
+      return;
+    }
 
     if (typeof navigator === 'undefined' || !navigator.clipboard) return;
 
@@ -676,7 +775,6 @@ export default function CanvasWhiteboard() {
           const imageType = item.types.find(t => t.startsWith('image/'));
           if (imageType) {
             const blob = await item.getType(imageType);
-            dlog('clipboard image found', { imageType });
             // 优先用本地解码获取尺寸，避免依赖网络图片加载
             let w = 0, h = 0;
             try {
@@ -708,7 +806,6 @@ export default function CanvasWhiteboard() {
               const filePath = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
               const { error: upErr } = await supabaseRef.current.storage.from('cards').upload(filePath, blob, { upsert: true, contentType: imageType });
               if (upErr) throw upErr;
-              dlog('storage upload ok', { filePath });
               // 本地立即缓存以便绘制（避免依赖远程图片加载）
               try {
                 const tmpUrl = URL.createObjectURL(blob);
@@ -762,9 +859,7 @@ export default function CanvasWhiteboard() {
         setCards(prev => [...prev, newCard]);
         if (userId && supabaseRef.current) scheduleSave(newCard);
       }
-    } catch (err) {
-      console.error('读取剪贴板失败', err);
-    }
+    } catch (err) {}
   };
 
   useLayoutEffect(() => {
@@ -773,11 +868,9 @@ export default function CanvasWhiteboard() {
 
     const listener = (event) => handleWheel(event);
     canvas.addEventListener('wheel', listener, { passive: false });
-    dlog('wheel listener attached');
 
     return () => {
       canvas.removeEventListener('wheel', listener);
-      dlog('wheel listener removed');
     };
   }, [handleWheel]);
 
@@ -794,14 +887,9 @@ export default function CanvasWhiteboard() {
         const tgt = e.target;
         const isEditable = tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable);
         if (isEditable) return;
-        if (selectedCardId != null) {
+        if (selectedIds.size > 0) {
           e.preventDefault();
-          setCards(prev => prev.filter(c => c.id !== selectedCardId));
-          // 删除远端
-          if (userId && supabaseRef.current) {
-            supabaseRef.current.from('cards').delete().match({ id: String(selectedCardId), user_id: userId }).then(() => {});
-          }
-          setSelectedCardId(null);
+          deleteSelected();
         }
       }
     };
@@ -821,7 +909,13 @@ export default function CanvasWhiteboard() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [isSpacePressed, showInput, selectedCardId, userId]);
+  }, [isSpacePressed, showInput, selectedIds, userId, deleteSelected]);
+
+  // 使用说明 5 秒后自动折叠
+  useEffect(() => {
+    const t = setTimeout(() => setIsGuideCollapsed(true), 5000);
+    return () => clearTimeout(t);
+  }, []);
 
   // 输入框获得焦点
   useEffect(() => {
@@ -845,7 +939,6 @@ export default function CanvasWhiteboard() {
       // 设备像素尺寸
       canvas.width = Math.floor(cssW * dpr);
       canvas.height = Math.floor(cssH * dpr);
-      dlog('resize', { cssW, cssH, dpr, width: canvas.width, height: canvas.height });
       drawCards();
     };
 
@@ -854,16 +947,13 @@ export default function CanvasWhiteboard() {
     return () => window.removeEventListener('resize', resize);
   }, [cards, scale, offset]);
 
-  // 重绘画布
+  // 重绘画布（依赖更多交互态，确保高亮/悬停/选择及时更新）
   useLayoutEffect(() => {
-    dlog('layout redraw', { cards: cards.length, scale, offset });
     drawCards();
-  }, [cards, scale, offset]);
+  }, [cards, scale, offset, selectedIds, hoveredCardId, hoveredHandle, draggedCard, resizing]);
 
   // 观察 cards 变化
-  useEffect(() => {
-    dlog('cards changed', cards.map(c => ({ id: c.id, type: c.type })));
-  }, [cards]);
+  useEffect(() => {}, [cards]);
 
   // 页面可见性变化时强制重绘，避免偶发的首帧被清空
   useEffect(() => {
@@ -892,10 +982,8 @@ export default function CanvasWhiteboard() {
         refresh_token: session.supabaseRefreshToken,
       });
       if (error) {
-        console.error('Supabase setSession error', error);
         return;
       }
-      dlog('supabase setSession ok');
       supabaseRef.current = supabase;
       // 拉取初始数据
       const { data: rows, error: qerr } = await supabase
@@ -903,10 +991,8 @@ export default function CanvasWhiteboard() {
         .select('*')
         .eq('user_id', userId)
         .order('updated_at', { ascending: true });
-      dlog('initial query finished', { error: qerr ? qerr.message : null });
       if (!qerr && Array.isArray(rows)) {
         const list = rows.map(r => fromRow(r));
-        dlog('initial fetch ok', { count: list.length });
         setCards(list);
         // 预加载图片（私有桶：使用签名 URL）
         for (const c of list) {
@@ -933,7 +1019,6 @@ export default function CanvasWhiteboard() {
           }
         }
       } else if (qerr) {
-        console.error('Load cards error', qerr);
       }
 
       // 订阅实时变更
@@ -945,7 +1030,6 @@ export default function CanvasWhiteboard() {
           if (!id) return;
           if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
             const card = fromRow(payload.new);
-            dlog('realtime upsert', { id: card.id, type: card.type });
             setCards(prev => {
               const exists = prev.some(c => String(c.id) === String(card.id));
               if (exists) return prev.map(c => (String(c.id) === String(card.id) ? card : c));
@@ -972,7 +1056,6 @@ export default function CanvasWhiteboard() {
               })();
             }
           } else if (payload.eventType === 'DELETE') {
-            dlog('realtime delete', { id });
             setCards(prev => prev.filter(c => String(c.id) !== String(id)));
           }
         })
@@ -1019,11 +1102,8 @@ export default function CanvasWhiteboard() {
     if (timers.has(key)) clearTimeout(timers.get(key));
     const t = setTimeout(async () => {
       try {
-        dlog('upsert card', { id: card.id, type: card.type });
         await supabaseRef.current.from('cards').upsert([toRow(card)], { onConflict: 'id' });
-      } catch (e) {
-        console.error('save card error', e);
-      }
+      } catch (e) {}
     }, 300);
     timers.set(key, t);
   };
@@ -1059,6 +1139,10 @@ export default function CanvasWhiteboard() {
     };
   };
 
+  // 已选计数：分享仅统计图片，删除统计全部
+  const selectedImageCount = cards.reduce((acc, c) => acc + (selectedIds.has(c.id) && c.type === 'image' ? 1 : 0), 0);
+  const selectedTotalCount = selectedIds.size;
+
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden' }}>
       <canvas
@@ -1071,6 +1155,29 @@ export default function CanvasWhiteboard() {
         onMouseLeave={handleMouseUp}
         style={{ cursor: getCursor(), display: 'block' }}
       />
+
+      {/* 复制/分享提示动画 */}
+      {hint && (
+        <div
+          style={{
+            position: 'absolute',
+            left: `${hint.x}px`,
+            top: `${hint.y}px`,
+            transform: hint.fading ? 'translate(-50%, -18px) scale(0.98)' : 'translate(-50%, -8px) scale(1)',
+            opacity: hint.fading ? 0 : 1,
+            transition: 'opacity 600ms ease, transform 500ms ease',
+            padding: '6px 10px',
+            borderRadius: 8,
+            pointerEvents: 'none',
+            fontSize: 12,
+            color: '#fff',
+            background: hint.tone === 'success' ? '#10b981' : (hint.tone === 'error' ? '#ef4444' : '#6b7280'),
+            boxShadow: '0 6px 18px rgba(0,0,0,0.15)'
+          }}
+        >
+          {hint.text}
+        </div>
+      )}
 
       {/* 输入框 */}
       {showInput && (
@@ -1157,40 +1264,106 @@ export default function CanvasWhiteboard() {
         缩放: {(scale * 100).toFixed(0)}%
       </div>
 
-      {/* 使用说明 / 用户状态 */}
-      <div style={{
-        position: 'absolute',
-        top: '20px',
-        right: '20px',
-        background: 'rgba(255, 255, 255, 0.95)',
-        padding: '16px',
-        borderRadius: '8px',
-        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-        fontSize: '14px',
-        maxWidth: '300px'
-      }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-          <h3 style={{ margin: 0, fontSize: '16px' }}>使用说明</h3>
-          <div>
-            {status === 'authenticated' ? (
-              <>
-                <span style={{ marginRight: 8, color: '#374151' }}>{session?.user?.email}</span>
-                <button onClick={() => signOut()} style={{ padding: '4px 8px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fff', cursor: 'pointer' }}>退出</button>
-              </>
-            ) : (
-              <a href="/login" style={{ color: '#2563eb' }}>登录</a>
-            )}
+      {/* 使用说明 / 用户状态（可折叠） */}
+      {!isGuideCollapsed ? (
+        <div style={{
+          position: 'absolute',
+          top: '20px',
+          right: '20px',
+          background: '#f8fafc',
+          padding: '16px',
+          borderRadius: '10px',
+          border: '1px solid #e5e7eb',
+          boxShadow: '0 6px 18px rgba(0,0,0,0.10)',
+          fontSize: '14px',
+          maxWidth: '340px',
+          color: '#111827',
+          zIndex: 1000
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+            <h3 style={{ margin: 0, fontSize: '16px', color: '#111827' }}>使用说明</h3>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {status === 'authenticated' ? (
+                <>
+                  <span style={{ marginRight: 8, color: '#374151' }}>{session?.user?.email}</span>
+                  <button onClick={() => signOut()} style={{ padding: '4px 8px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fff', cursor: 'pointer' }}>退出</button>
+                </>
+              ) : (
+                <a href="/login" style={{ color: '#2563eb' }}>登录</a>
+              )}
+              <button
+                onClick={() => setIsGuideCollapsed(true)}
+                title="折叠"
+                style={{ padding: '4px 8px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fff', cursor: 'pointer' }}
+              >收起</button>
+            </div>
+          </div>
+          <ul style={{ margin: 0, paddingLeft: '20px' }}>
+            <li>点击空白处粘贴剪贴板（图/文）</li>
+            <li>双击空白处手动添加文字卡片</li>
+            <li>拖动卡片移动位置</li>
+            <li>按住空格键拖拽白板</li>
+            <li>Ctrl + 滚轮缩放画布</li>
+            <li>默认多选，支持批量分享图片</li>
+          </ul>
+          {/* 分享按钮仅在折叠状态下展示 */}
+        </div>
+      ) : (
+        <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1000 }}>
+          <div
+            onClick={() => setIsGuideCollapsed(false)}
+            title={status === 'authenticated' ? (session?.user?.email || '') : '登录'}
+            style={{
+              background: '#111827',
+              color: '#fff',
+              padding: '10px 14px',
+              borderRadius: 999,
+              border: '1px solid #111827',
+              boxShadow: '0 6px 18px rgba(0,0,0,0.15)',
+              fontSize: 13,
+              cursor: 'pointer',
+              maxWidth: '60vw',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}
+          >
+            {status === 'authenticated' ? (session?.user?.email || '') : '登录'}
+        </div>
+          <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              onClick={shareSelected}
+              disabled={selectedImageCount === 0}
+              style={{
+                padding: '8px 12px',
+                borderRadius: 8,
+                border: 'none',
+                background: selectedImageCount ? '#3b82f6' : '#cbd5e1',
+                color: '#fff',
+                cursor: selectedImageCount ? 'pointer' : 'not-allowed',
+                fontSize: 14,
+                fontWeight: 500
+              }}
+            >分享已选 {selectedImageCount ? `(${selectedImageCount})` : ''}</button>
+          </div>
+          <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              onClick={deleteSelected}
+              disabled={selectedTotalCount === 0}
+              style={{
+                padding: '8px 12px',
+                borderRadius: 8,
+                border: 'none',
+                background: selectedTotalCount ? '#ef4444' : '#f3f4f6',
+                color: selectedTotalCount ? '#fff' : '#9ca3af',
+                cursor: selectedTotalCount ? 'pointer' : 'not-allowed',
+                fontSize: 14,
+                fontWeight: 500
+              }}
+            >删除已选 {selectedTotalCount ? `(${selectedTotalCount})` : ''}</button>
           </div>
         </div>
-        <ul style={{ margin: 0, paddingLeft: '20px' }}>
-          <li>点击空白处粘贴剪贴板（图/文）</li>
-          <li>双击空白处手动添加文字卡片</li>
-          <li>拖动卡片移动位置</li>
-          <li>按住空格键拖拽白板</li>
-          <li>Ctrl + 滚轮缩放画布</li>
-          <li>登录后，卡片会实时保存在云端</li>
-        </ul>
-      </div>
+      )}
     </div>
   );
 }
