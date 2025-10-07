@@ -5,7 +5,10 @@ import { createBrowserSupabase } from '@/lib/supabaseClient';
 
 export default function CanvasWhiteboard() {
   const canvasRef = useRef(null);
-  const pointerStateRef = useRef({ x: 0, y: 0, moved: false });
+  const pointerStateRef = useRef({ x: 0, y: 0, moved: false, pointerId: null });
+  const activePointersRef = useRef(new Map()); // pointerId -> { x, y, pointerType }
+  const pinchStateRef = useRef(null); // 当前缩放手势状态
+  const panPointerRef = useRef(null); // 当前驱动平移的指针 ID
   const supabaseRef = useRef(null);
   const [cards, setCards] = useState([]);
   const [hint, setHint] = useState(null); // { x, y, text, tone: 'success'|'info'|'error', fading: bool }
@@ -458,27 +461,57 @@ export default function CanvasWhiteboard() {
     setInputText('');
   };
 
-  // 处理鼠标按下
-  const handleMouseDown = (e) => {
-    const rect = canvasRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+  // 处理指针按下（兼容鼠标与触摸）
+  const handlePointerDown = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    pointerStateRef.current = { x: mouseX, y: mouseY, moved: false };
+    const rect = canvas.getBoundingClientRect();
+    const pointerX = e.clientX - rect.left;
+    const pointerY = e.clientY - rect.top;
+    const isTouch = e.pointerType === 'touch';
 
-    // 如果按住空格键，开始拖拽白板
+    pointerStateRef.current = { x: pointerX, y: pointerY, moved: false, pointerId: e.pointerId };
+
+    try {
+      canvas.setPointerCapture?.(e.pointerId);
+    } catch {}
+
+    activePointersRef.current.set(e.pointerId, { x: pointerX, y: pointerY, pointerType: e.pointerType });
+
+    const touchPoints = Array.from(activePointersRef.current.values()).filter(p => p.pointerType === 'touch');
+    if (touchPoints.length >= 2) {
+      const [p1, p2] = touchPoints.slice(0, 2);
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+      const centerX = (p1.x + p2.x) / 2;
+      const centerY = (p1.y + p2.y) / 2;
+      pinchStateRef.current = {
+        initialDistance: distance,
+        initialScale: scale,
+        centerCanvas: screenToCanvas(centerX, centerY),
+      };
+      setDraggedCard(null);
+      setResizing(null);
+      setIsPanning(false);
+      panPointerRef.current = null;
+      return;
+    } else {
+      pinchStateRef.current = null;
+    }
+
     if (isSpacePressed) {
       setIsPanning(true);
-      // 记录锚点（世界坐标）
-      const anchorCanvas = screenToCanvas(mouseX, mouseY);
+      panPointerRef.current = e.pointerId;
+      const anchorCanvas = screenToCanvas(pointerX, pointerY);
       setPanStart({ x: anchorCanvas.x, y: anchorCanvas.y });
-      // 初始化最后指针位置
-      pointerStateRef.current.x = mouseX;
-      pointerStateRef.current.y = mouseY;
+      pointerStateRef.current.x = pointerX;
+      pointerStateRef.current.y = pointerY;
       return;
     }
 
-    const canvasPos = screenToCanvas(mouseX, mouseY);
+    const canvasPos = screenToCanvas(pointerX, pointerY);
 
     // 优先检测是否按在缩放手柄上（从上到下）
     for (let i = cards.length - 1; i >= 0; i--) {
@@ -498,7 +531,7 @@ export default function CanvasWhiteboard() {
         { name: 'w', x: sp.x, y: sp.y + cardH / 2 },
       ];
       for (const h of handles) {
-        if (mouseX >= h.x - hs && mouseX <= h.x + hs && mouseY >= h.y - hs && mouseY <= h.y + hs) {
+        if (pointerX >= h.x - hs && pointerX <= h.x + hs && pointerY >= h.y - hs && pointerY <= h.y + hs) {
           setResizing({
             id: card.id,
             handle: h.name,
@@ -522,11 +555,15 @@ export default function CanvasWhiteboard() {
           x: canvasPos.x - card.x,
           y: canvasPos.y - card.y
         });
+        // 触摸拖拽卡片时不立即开启平移
+        if (isTouch) {
+          panPointerRef.current = null;
+        }
         break;
       }
     }
 
-    // 点击在空白区域则清除选中
+    // 点击在空白区域则清除选中，并支持触摸平移
     if (!draggedCard && !resizing) {
       let clickedAny = false;
       for (let i = cards.length - 1; i >= 0; i--) {
@@ -536,37 +573,75 @@ export default function CanvasWhiteboard() {
           break;
         }
       }
-      if (!clickedAny) setSelectedIds(new Set());
+      if (!clickedAny) {
+        setSelectedIds(new Set());
+        if (isTouch) {
+          setIsPanning(true);
+          panPointerRef.current = e.pointerId;
+          const anchorCanvas = screenToCanvas(pointerX, pointerY);
+          setPanStart({ x: anchorCanvas.x, y: anchorCanvas.y });
+        }
+      }
     }
   };
 
-  // 处理鼠标移动
-  const handleMouseMove = (e) => {
-    const rect = canvasRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+  // 处理指针移动
+  const handlePointerMove = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const pointerX = e.clientX - rect.left;
+    const pointerY = e.clientY - rect.top;
+
+    if (activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, { x: pointerX, y: pointerY, pointerType: e.pointerType });
+    }
 
     if (!pointerStateRef.current.moved) {
-      const dx = Math.abs(mouseX - pointerStateRef.current.x);
-      const dy = Math.abs(mouseY - pointerStateRef.current.y);
-      if (dx > 2 || dy > 2) {
+      const dx0 = Math.abs(pointerX - pointerStateRef.current.x);
+      const dy0 = Math.abs(pointerY - pointerStateRef.current.y);
+      if (dx0 > 2 || dy0 > 2) {
         pointerStateRef.current.moved = true;
       }
     }
 
-    // 如果正在拖拽白板（锚点式平移：保持按下时的世界点在鼠标下）
-    if (isPanning) {
+    const touchPoints = Array.from(activePointersRef.current.values()).filter(p => p.pointerType === 'touch');
+    if (pinchStateRef.current && touchPoints.length >= 2) {
+      const [p1, p2] = touchPoints.slice(0, 2);
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+      const base = pinchStateRef.current.initialDistance || 1;
+      const ratio = distance / base;
+      const newScale = Math.max(0.1, Math.min(5, pinchStateRef.current.initialScale * ratio));
+      const centerX = (p1.x + p2.x) / 2;
+      const centerY = (p1.y + p2.y) / 2;
+      const centerCanvas = pinchStateRef.current.centerCanvas;
+      setScale(newScale);
       setOffset({
-        x: mouseX - panStart.x * scale,
-        y: mouseY - panStart.y * scale
+        x: centerX - centerCanvas.x * newScale,
+        y: centerY - centerCanvas.y * newScale,
       });
-      // 更新最后指针位置
-      pointerStateRef.current.x = mouseX;
-      pointerStateRef.current.y = mouseY;
+      pointerStateRef.current.x = pointerX;
+      pointerStateRef.current.y = pointerY;
       return;
     }
 
-    const canvasPos = screenToCanvas(mouseX, mouseY);
+    // 如果正在拖拽白板（锚点式平移：保持按下时的世界点在指针下）
+    if (isPanning) {
+      if (panPointerRef.current === null || panPointerRef.current === e.pointerId || e.pointerType !== 'touch') {
+        setOffset({
+          x: pointerX - panStart.x * scale,
+          y: pointerY - panStart.y * scale
+        });
+        pointerStateRef.current.x = pointerX;
+        pointerStateRef.current.y = pointerY;
+      }
+      return;
+    }
+
+    const canvasPos = screenToCanvas(pointerX, pointerY);
 
     // 如果正在缩放卡片
     if (resizing) {
@@ -653,7 +728,7 @@ export default function CanvasWhiteboard() {
           { name: 'w', x: sp.x, y: sp.y + cardH / 2 },
         ];
         for (const h of handles) {
-          if (mouseX >= h.x - hs && mouseX <= h.x + hs && mouseY >= h.y - hs && mouseY <= h.y + hs) {
+          if (pointerX >= h.x - hs && pointerX <= h.x + hs && pointerY >= h.y - hs && pointerY <= h.y + hs) {
             handleName = h.name;
             break;
           }
@@ -664,16 +739,34 @@ export default function CanvasWhiteboard() {
     setHoveredCardId(hoverId);
     setHoveredHandle(handleName);
 
-    // 更新最后指针位置
-    pointerStateRef.current.x = mouseX;
-    pointerStateRef.current.y = mouseY;
+    pointerStateRef.current.x = pointerX;
+    pointerStateRef.current.y = pointerY;
   };
 
-  // 处理鼠标松开
-  const handleMouseUp = (e) => {
+  // 结束指针交互
+  const stopPointerTracking = (pointerId) => {
+    activePointersRef.current.delete(pointerId);
+    if (panPointerRef.current === pointerId) {
+      panPointerRef.current = null;
+    }
+    const remainingTouches = Array.from(activePointersRef.current.values()).filter(p => p.pointerType === 'touch');
+    if (remainingTouches.length < 2) {
+      pinchStateRef.current = null;
+    }
+    if (pointerStateRef.current.pointerId === pointerId) {
+      pointerStateRef.current.pointerId = null;
+    }
+  };
+
+  const handlePointerUp = (e) => {
+    const canvas = canvasRef.current;
+    try {
+      canvas?.releasePointerCapture?.(e.pointerId);
+    } catch {}
+    stopPointerTracking(e.pointerId);
     setDraggedCard(null);
-    setIsPanning(false);
     setResizing(null);
+    setIsPanning(false);
   };
 
   // 处理滚轮缩放
@@ -1149,11 +1242,12 @@ export default function CanvasWhiteboard() {
         ref={canvasRef}
         onClick={handleCanvasClick}
         onDoubleClick={handleCanvasDoubleClick}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        style={{ cursor: getCursor(), display: 'block' }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        style={{ cursor: getCursor(), display: 'block', touchAction: 'none' }}
       />
 
       {/* 复制/分享提示动画 */}
