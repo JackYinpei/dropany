@@ -39,6 +39,12 @@ export default function CanvasWhiteboard() {
   const saveTimersRef = useRef(new Map()); // id -> timeout
   const [isGuideCollapsed, setIsGuideCollapsed] = useState(false); // 使用说明是否折叠
 
+  useEffect(() => {
+    if (session?.error === 'SupabaseRefreshFailed' || session?.error === 'MissingSupabaseRefreshToken') {
+      signOut({ callbackUrl: '/login' });
+    }
+  }, [session?.error]);
+
   // 轻提示动画
   const showHint = useCallback((text, x, y, tone = 'success') => {
     const pos = { x: Math.max(12, Math.min(x, (typeof window !== 'undefined' ? window.innerWidth - 12 : x))), y: Math.max(12, y - 20) };
