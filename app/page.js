@@ -22,7 +22,10 @@ export default function CanvasWhiteboard() {
   const [showInput, setShowInput] = useState(false);
   const [inputPosition, setInputPosition] = useState({ x: 0, y: 0 });
   const [inputText, setInputText] = useState('');
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const inputRef = useRef(null);
+  const minimapSvgRef = useRef(null);
+  const minimapPointerActiveRef = useRef(false);
   // 始终指向最新的绘制函数，用于异步回调中调用
   const drawRef = useRef(() => {});
   // 缓存已加载图片，避免重复加载
@@ -1038,6 +1041,7 @@ export default function CanvasWhiteboard() {
       // 设备像素尺寸
       canvas.width = Math.floor(cssW * dpr);
       canvas.height = Math.floor(cssH * dpr);
+      setViewportSize(prev => (prev.width === cssW && prev.height === cssH ? prev : { width: cssW, height: cssH }));
       drawCards();
     };
 
@@ -1242,6 +1246,112 @@ export default function CanvasWhiteboard() {
   const selectedImageCount = cards.reduce((acc, c) => acc + (selectedIds.has(c.id) && c.type === 'image' ? 1 : 0), 0);
   const selectedTotalCount = selectedIds.size;
 
+  const minimapWidth = 200;
+  const minimapHeight = 140;
+  const hasViewport = viewportSize.width > 0 && viewportSize.height > 0;
+  const viewportTopLeft = hasViewport ? screenToCanvas(0, 0) : null;
+  const viewportBottomRight = hasViewport ? screenToCanvas(viewportSize.width, viewportSize.height) : null;
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  if (viewportTopLeft && viewportBottomRight) {
+    minX = Math.min(minX, viewportTopLeft.x, viewportBottomRight.x);
+    minY = Math.min(minY, viewportTopLeft.y, viewportBottomRight.y);
+    maxX = Math.max(maxX, viewportTopLeft.x, viewportBottomRight.x);
+    maxY = Math.max(maxY, viewportTopLeft.y, viewportBottomRight.y);
+  }
+
+  cards.forEach(card => {
+    minX = Math.min(minX, card.x, card.x + card.width);
+    minY = Math.min(minY, card.y, card.y + card.height);
+    maxX = Math.max(maxX, card.x, card.x + card.width);
+    maxY = Math.max(maxY, card.y, card.y + card.height);
+  });
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+    minX = -100; minY = -100; maxX = 100; maxY = 100;
+  }
+
+  const baseWidth = Math.max(1, maxX - minX);
+  const baseHeight = Math.max(1, maxY - minY);
+  const padX = baseWidth * 0.05 + 40;
+  const padY = baseHeight * 0.05 + 40;
+  minX -= padX;
+  minY -= padY;
+  maxX += padX;
+  maxY += padY;
+
+  const worldWidth = Math.max(1, maxX - minX);
+  const worldHeight = Math.max(1, maxY - minY);
+  const minimapScale = Math.min(minimapWidth / worldWidth, minimapHeight / worldHeight);
+  const minimapOffsetX = (minimapWidth - worldWidth * minimapScale) / 2;
+  const minimapOffsetY = (minimapHeight - worldHeight * minimapScale) / 2;
+
+  const viewportRect = (viewportTopLeft && viewportBottomRight) ? {
+    x: minimapOffsetX + (Math.min(viewportTopLeft.x, viewportBottomRight.x) - minX) * minimapScale,
+    y: minimapOffsetY + (Math.min(viewportTopLeft.y, viewportBottomRight.y) - minY) * minimapScale,
+    width: Math.max(2, Math.abs(viewportBottomRight.x - viewportTopLeft.x) * minimapScale),
+    height: Math.max(2, Math.abs(viewportBottomRight.y - viewportTopLeft.y) * minimapScale),
+  } : null;
+
+  const minimapMarkers = cards.map(card => {
+    const centerX = card.x + card.width / 2;
+    const centerY = card.y + card.height / 2;
+    return {
+      id: card.id,
+      x: minimapOffsetX + (centerX - minX) * minimapScale,
+      y: minimapOffsetY + (centerY - minY) * minimapScale,
+    };
+  });
+
+  const handleMinimapNavigate = useCallback((clientX, clientY) => {
+    if (!hasViewport || !viewportSize.width || !viewportSize.height) return;
+    const svgEl = minimapSvgRef.current;
+    if (!svgEl || !minimapScale) return;
+    const rect = svgEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const localX = Math.max(0, Math.min(minimapWidth, ((clientX - rect.left) / rect.width) * minimapWidth));
+    const localY = Math.max(0, Math.min(minimapHeight, ((clientY - rect.top) / rect.height) * minimapHeight));
+    const worldX = minX + (localX - minimapOffsetX) / minimapScale;
+    const worldY = minY + (localY - minimapOffsetY) / minimapScale;
+    const newOffset = {
+      x: viewportSize.width / 2 - worldX * scale,
+      y: viewportSize.height / 2 - worldY * scale,
+    };
+    setOffset(newOffset);
+  }, [hasViewport, viewportSize.width, viewportSize.height, minimapScale, minimapOffsetX, minimapOffsetY, minX, minY, scale, setOffset]);
+
+  const handleMinimapPointerDown = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    minimapPointerActiveRef.current = true;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    handleMinimapNavigate(e.clientX, e.clientY);
+  }, [handleMinimapNavigate]);
+
+  const handleMinimapPointerMove = useCallback((e) => {
+    if (!minimapPointerActiveRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    handleMinimapNavigate(e.clientX, e.clientY);
+  }, [handleMinimapNavigate]);
+
+  const handleMinimapPointerUp = useCallback((e) => {
+    if (!minimapPointerActiveRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    minimapPointerActiveRef.current = false;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+  }, []);
+
+  const preventEvent = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden' }}>
       <canvas
@@ -1362,6 +1472,75 @@ export default function CanvasWhiteboard() {
         userSelect: 'none'
       }}>
         缩放: {(scale * 100).toFixed(0)}%
+      </div>
+
+      <div
+        style={{
+          position: 'absolute',
+          right: '20px',
+          bottom: '20px',
+          width: minimapWidth + 24,
+          height: minimapHeight + 48,
+          background: 'rgba(17, 24, 39, 0.82)',
+          borderRadius: 14,
+          padding: '12px 14px',
+          boxShadow: '0 12px 28px rgba(0,0,0,0.35)',
+          color: '#e5e7eb',
+          fontSize: 12,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          pointerEvents: 'auto',
+          zIndex: 1200,
+        }}
+        onPointerDown={handleMinimapPointerDown}
+        onPointerMove={handleMinimapPointerMove}
+        onPointerUp={handleMinimapPointerUp}
+        onPointerCancel={handleMinimapPointerUp}
+        onPointerLeave={handleMinimapPointerUp}
+        onClick={preventEvent}
+        onDoubleClick={preventEvent}
+        onWheel={preventEvent}
+        onContextMenu={preventEvent}
+      >
+        <div style={{ fontWeight: 500, letterSpacing: '0.02em' }}>小地图</div>
+        <div style={{ position: 'relative', flex: 1 }}>
+          <svg
+            width={minimapWidth}
+            height={minimapHeight}
+            viewBox={`0 0 ${minimapWidth} ${minimapHeight}`}
+            style={{ width: '100%', height: '100%', display: 'block' }}
+            ref={minimapSvgRef}
+          >
+            <rect
+              x={0}
+              y={0}
+              width={minimapWidth}
+              height={minimapHeight}
+              rx={12}
+              ry={12}
+              fill="rgba(255,255,255,0.08)"
+              stroke="rgba(255,255,255,0.2)"
+              strokeWidth={1}
+            />
+            {viewportRect && (
+              <rect
+                x={viewportRect.x}
+                y={viewportRect.y}
+                width={viewportRect.width}
+                height={viewportRect.height}
+                fill="rgba(59,130,246,0.18)"
+                stroke="#3b82f6"
+                strokeWidth={1.5}
+                rx={4}
+                ry={4}
+              />
+            )}
+            {minimapMarkers.map(marker => (
+              <circle key={marker.id} cx={marker.x} cy={marker.y} r={4} fill="#ef4444" stroke="#ffffff" strokeWidth={1} />
+            ))}
+          </svg>
+        </div>
       </div>
 
       {/* 使用说明 / 用户状态（可折叠） */}
