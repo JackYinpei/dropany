@@ -41,6 +41,16 @@ export default function CanvasWhiteboard() {
   const userId = session?.user?.id || null;
   const saveTimersRef = useRef(new Map()); // id -> timeout
   const [isGuideCollapsed, setIsGuideCollapsed] = useState(false); // 使用说明是否折叠
+  const pendingPasteTimeoutRef = useRef(null);
+  const [editingCardId, setEditingCardId] = useState(null);
+  const longPressTimerRef = useRef(null);
+  const longPressTargetRef = useRef(null);
+  const [contextMenu, setContextMenu] = useState(null);
+  const cardsRef = useRef(cards);
+
+  useEffect(() => {
+    cardsRef.current = cards;
+  }, [cards]);
 
   useEffect(() => {
     if (session?.error === 'SupabaseRefreshFailed' || session?.error === 'MissingSupabaseRefreshToken') {
@@ -154,6 +164,37 @@ export default function CanvasWhiteboard() {
       x: canvasX * scale + offset.x,
       y: canvasY * scale + offset.y
     };
+  };
+
+  const clearPendingPasteTimeout = () => {
+    if (pendingPasteTimeoutRef.current) {
+      clearTimeout(pendingPasteTimeoutRef.current);
+      pendingPasteTimeoutRef.current = null;
+    }
+  };
+
+  const cancelLongPress = (pointerId = null) => {
+    if (longPressTimerRef.current) {
+      if (pointerId === null || longPressTargetRef.current?.pointerId === pointerId) {
+        clearTimeout(longPressTimerRef.current);
+        longPressTimerRef.current = null;
+        longPressTargetRef.current = null;
+      }
+    }
+  };
+
+  const beginEditCard = (card, positionOverride = null) => {
+    if (!card || card.type !== 'text') return;
+    const pos = positionOverride || { x: card.x, y: card.y };
+    setInputPosition(pos);
+    setInputText(card.text || '');
+    setEditingCardId(card.id);
+    setShowInput(true);
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      next.add(card.id);
+      return next;
+    });
   };
 
   // 文本换行：支持空格优先换行，长字符串回退按字符换行，支持多段落\n
@@ -411,6 +452,9 @@ export default function CanvasWhiteboard() {
   const handleCanvasDoubleClick = async (e) => {
     if (isPanning) return;
 
+    clearPendingPasteTimeout();
+    setContextMenu(null);
+
     const rect = canvasRef.current.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
@@ -439,41 +483,61 @@ export default function CanvasWhiteboard() {
     // 双击空白：显示输入框
     setInputPosition(canvasPos);
     setInputText('');
+    setEditingCardId(null);
     setShowInput(true);
   };
 
   // 添加卡片
   const handleAddCard = () => {
-    if (inputText.trim()) {
+    const nextText = editingCardId ? inputText : inputText.trim();
+
+    if (editingCardId) {
+      let updatedCard = null;
+      setCards(prev => prev.map(card => {
+        if (card.id !== editingCardId) return card;
+        updatedCard = { ...card, text: nextText };
+        return updatedCard;
+      }));
+      if (updatedCard && userId && supabaseRef.current) {
+        scheduleSave(updatedCard);
+      }
+    } else if (nextText) {
       const newCard = {
         id: Date.now(),
         type: 'text',
-        text: inputText.trim(),
+        text: nextText,
         x: inputPosition.x,
         y: inputPosition.y,
         width: 200,
         height: 100
       };
-      setCards([...cards, newCard]);
+      setCards(prev => [...prev, newCard]);
       // 持久化
       if (userId && supabaseRef.current) {
         scheduleSave(newCard);
       }
     }
+
     setShowInput(false);
     setInputText('');
+    setEditingCardId(null);
   };
 
   // 取消输入
   const handleCancelInput = () => {
     setShowInput(false);
     setInputText('');
+    setEditingCardId(null);
   };
 
   // 处理指针按下（兼容鼠标与触摸）
   const handlePointerDown = (e) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    clearPendingPasteTimeout();
+    setContextMenu(null);
+    cancelLongPress();
 
     const rect = canvas.getBoundingClientRect();
     const pointerX = e.clientX - rect.left;
@@ -567,6 +631,27 @@ export default function CanvasWhiteboard() {
         // 触摸拖拽卡片时不立即开启平移
         if (isTouch) {
           panPointerRef.current = null;
+          if (card.type === 'text') {
+            const cardId = card.id;
+            longPressTargetRef.current = { pointerId: e.pointerId, cardId };
+            longPressTimerRef.current = setTimeout(() => {
+              if (!longPressTargetRef.current || longPressTargetRef.current.pointerId !== e.pointerId || longPressTargetRef.current.cardId !== cardId) {
+                return;
+              }
+              if (pointerStateRef.current.moved) {
+                return;
+              }
+              const latest = cardsRef.current?.find(c => c.id === cardId);
+              if (latest) {
+                beginEditCard(latest);
+              }
+              setDraggedCard(null);
+              setResizing(null);
+              setIsPanning(false);
+              longPressTargetRef.current = null;
+              longPressTimerRef.current = null;
+            }, 500);
+          }
         }
         break;
       }
@@ -612,6 +697,7 @@ export default function CanvasWhiteboard() {
       const dy0 = Math.abs(pointerY - pointerStateRef.current.y);
       if (dx0 > 2 || dy0 > 2) {
         pointerStateRef.current.moved = true;
+        cancelLongPress(e.pointerId);
       }
     }
 
@@ -772,6 +858,7 @@ export default function CanvasWhiteboard() {
     try {
       canvas?.releasePointerCapture?.(e.pointerId);
     } catch {}
+    cancelLongPress(e.pointerId);
     stopPointerTracking(e.pointerId);
     setDraggedCard(null);
     setResizing(null);
@@ -834,7 +921,10 @@ export default function CanvasWhiteboard() {
     }
   }, [scale, offset, cards, userId]);
 
-  const handleCanvasClick = async (e) => {
+  const handleCanvasClick = (e) => {
+    clearPendingPasteTimeout();
+    setContextMenu(null);
+
     if (e.detail > 1 || isPanning || isSpacePressed || showInput) return;
 
     const canvas = canvasRef.current;
@@ -868,100 +958,166 @@ export default function CanvasWhiteboard() {
 
     if (typeof navigator === 'undefined' || !navigator.clipboard) return;
 
-    // 优先尝试读取图片，其次读取文本
-    try {
-      if (navigator.clipboard.read) {
-        const items = await navigator.clipboard.read();
-        let added = false;
-        for (const item of items) {
-          const imageType = item.types.find(t => t.startsWith('image/'));
-          if (imageType) {
-            const blob = await item.getType(imageType);
-            // 优先用本地解码获取尺寸，避免依赖网络图片加载
-            let w = 0, h = 0;
-            try {
-              if (typeof createImageBitmap === 'function') {
-                const bmp = await createImageBitmap(blob);
-                w = bmp.width; h = bmp.height;
-              } else {
-                // 兼容：用 objectURL + Image 读取尺寸
-                const tmpUrl = URL.createObjectURL(blob);
-                await new Promise((resolve, reject) => {
-                  const img = new Image();
-                  img.onload = () => { w = img.width; h = img.height; URL.revokeObjectURL(tmpUrl); resolve(); };
-                  img.onerror = (e) => { URL.revokeObjectURL(tmpUrl); reject(e); };
-                  img.src = tmpUrl;
-                });
+    const pasteFromClipboard = async () => {
+      try {
+        if (navigator.clipboard.read) {
+          const items = await navigator.clipboard.read();
+          let added = false;
+          for (const item of items) {
+            const imageType = item.types.find(t => t.startsWith('image/'));
+            if (imageType) {
+              const blob = await item.getType(imageType);
+              // 优先用本地解码获取尺寸，避免依赖网络图片加载
+              let w = 0, h = 0;
+              try {
+                if (typeof createImageBitmap === 'function') {
+                  const bmp = await createImageBitmap(blob);
+                  w = bmp.width; h = bmp.height;
+                } else {
+                  // 兼容：用 objectURL + Image 读取尺寸
+                  const tmpUrl = URL.createObjectURL(blob);
+                  await new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => { w = img.width; h = img.height; URL.revokeObjectURL(tmpUrl); resolve(); };
+                    img.onerror = (e) => { URL.revokeObjectURL(tmpUrl); reject(e); };
+                    img.src = tmpUrl;
+                  });
+                }
+              } catch (err) {
+                // 尺寸读取失败则给个默认
+                w = 200; h = 150;
               }
-            } catch (e) {
-              // 尺寸读取失败则给个默认
-              w = 200; h = 150;
-            }
-            // 按较长边等比缩放到 400
-            const maxDim = 400;
-            if (w > h && w > maxDim) { const s = maxDim / w; w = Math.round(w * s); h = Math.round(h * s); }
-            else if (h >= w && h > maxDim) { const s = maxDim / h; w = Math.round(w * s); h = Math.round(h * s); }
+              // 按较长边等比缩放到 400
+              const maxDim = 400;
+              if (w > h && w > maxDim) { const s = maxDim / w; w = Math.round(w * s); h = Math.round(h * s); }
+              else if (h >= w && h > maxDim) { const s = maxDim / h; w = Math.round(w * s); h = Math.round(h * s); }
 
-            // 若已登录则上传 Supabase Storage，否则走本地 objectURL
-            if (userId && supabaseRef.current) {
-              const ext = imageType.split('/')[1] || 'png';
-              const filePath = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
-              const { error: upErr } = await supabaseRef.current.storage.from('cards').upload(filePath, blob, { upsert: true, contentType: imageType });
-              if (upErr) throw upErr;
-              // 本地立即缓存以便绘制（避免依赖远程图片加载）
-              try {
-                const tmpUrl = URL.createObjectURL(blob);
+              // 若已登录则上传 Supabase Storage，否则走本地 objectURL
+              if (userId && supabaseRef.current) {
+                const ext = imageType.split('/')[1] || 'png';
+                const filePath = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+                const { error: upErr } = await supabaseRef.current.storage.from('cards').upload(filePath, blob, { upsert: true, contentType: imageType });
+                if (upErr) throw upErr;
+                // 本地立即缓存以便绘制（避免依赖远程图片加载）
+                try {
+                  const tmpUrl = URL.createObjectURL(blob);
+                  const img = new Image();
+                  img.onload = () => {
+                    imageCacheRef.current.set(filePath, img);
+                    objectUrlsRef.current.add(tmpUrl);
+                    if (drawRef.current) drawRef.current();
+                  };
+                  img.onerror = () => { URL.revokeObjectURL(tmpUrl); };
+                  img.src = tmpUrl;
+                } catch {}
+                const newCard = { id: Date.now(), type: 'image', src: filePath, x: canvasPos.x, y: canvasPos.y, width: w, height: h };
+                setCards(prev => [...prev, newCard]);
+                scheduleSave(newCard);
+              } else {
+                const url = URL.createObjectURL(blob);
                 const img = new Image();
-                img.onload = () => {
-                  imageCacheRef.current.set(filePath, img);
-                  objectUrlsRef.current.add(tmpUrl);
-                  if (drawRef.current) drawRef.current();
-                };
-                img.onerror = () => { URL.revokeObjectURL(tmpUrl); };
-                img.src = tmpUrl;
-              } catch {}
-              const newCard = { id: Date.now(), type: 'image', src: filePath, x: canvasPos.x, y: canvasPos.y, width: w, height: h };
-              setCards(prev => [...prev, newCard]);
-              scheduleSave(newCard);
-            } else {
-              const url = URL.createObjectURL(blob);
-              const img = new Image();
-              try {
-                await new Promise((resolve, reject) => {
-                  img.onload = resolve;
-                  img.onerror = reject;
-                  img.src = url;
-                });
-                imageCacheRef.current.set(url, img);
-                objectUrlsRef.current.add(url);
-              } catch {}
-              const newCard = { id: Date.now(), type: 'image', src: url, x: canvasPos.x, y: canvasPos.y, width: w, height: h };
-              setCards(prev => [...prev, newCard]);
+                try {
+                  await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                    img.src = url;
+                  });
+                  imageCacheRef.current.set(url, img);
+                  objectUrlsRef.current.add(url);
+                } catch {}
+                const newCard = { id: Date.now(), type: 'image', src: url, x: canvasPos.x, y: canvasPos.y, width: w, height: h };
+                setCards(prev => [...prev, newCard]);
+              }
+              added = true;
+              break;
             }
-            added = true;
-            break;
           }
+          if (added) return;
         }
-        if (added) return;
-      }
 
-      if (navigator.clipboard.readText) {
-        const text = await navigator.clipboard.readText();
-        const trimmed = text.trim();
-        if (!trimmed) return;
-        const newCard = {
-          id: Date.now(),
-          type: 'text',
-          text: trimmed,
-          x: canvasPos.x,
-          y: canvasPos.y,
-          width: 200,
-          height: 100
-        };
-        setCards(prev => [...prev, newCard]);
-        if (userId && supabaseRef.current) scheduleSave(newCard);
+        if (navigator.clipboard.readText) {
+          const text = await navigator.clipboard.readText();
+          const trimmed = text.trim();
+          if (!trimmed) return;
+          const newCard = {
+            id: Date.now(),
+            type: 'text',
+            text: trimmed,
+            x: canvasPos.x,
+            y: canvasPos.y,
+            width: 200,
+            height: 100
+          };
+          setCards(prev => [...prev, newCard]);
+          if (userId && supabaseRef.current) scheduleSave(newCard);
+        }
+      } catch (err) {}
+    };
+
+    pendingPasteTimeoutRef.current = setTimeout(() => {
+      pasteFromClipboard().finally(() => {
+        pendingPasteTimeoutRef.current = null;
+      });
+    }, 220);
+  };
+
+  const handleCanvasContextMenu = (e) => {
+    e.preventDefault();
+    clearPendingPasteTimeout();
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const pointerX = e.clientX - rect.left;
+    const pointerY = e.clientY - rect.top;
+    const canvasPos = screenToCanvas(pointerX, pointerY);
+
+    for (let i = cards.length - 1; i >= 0; i--) {
+      const card = cards[i];
+      if (canvasPos.x >= card.x && canvasPos.x <= card.x + card.width && canvasPos.y >= card.y && canvasPos.y <= card.y + card.height) {
+        setSelectedIds(new Set([card.id]));
+        setContextMenu({
+          x: e.clientX,
+          y: e.clientY,
+          cardId: card.id,
+          cardType: card.type
+        });
+        return;
       }
-    } catch (err) {}
+    }
+
+    setContextMenu(null);
+    setSelectedIds(new Set());
+  };
+
+  const handleContextMenuAction = async (action) => {
+    if (!contextMenu) return;
+    clearPendingPasteTimeout();
+
+    const target = cards.find(card => card.id === contextMenu.cardId);
+    setContextMenu(null);
+    if (!target) return;
+
+    if (action === 'edit') {
+      beginEditCard(target);
+      return;
+    }
+
+    if (action === 'delete') {
+      setCards(prev => prev.filter(card => card.id !== target.id));
+      setSelectedIds(prev => {
+        const next = new Set(prev);
+        next.delete(target.id);
+        return next;
+      });
+      if (userId && supabaseRef.current) {
+        try {
+          await supabaseRef.current.from('cards').delete().eq('id', target.id).eq('user_id', userId);
+        } catch {}
+      }
+      showHint('已删除', contextMenu.x, contextMenu.y, 'success');
+    }
   };
 
   useLayoutEffect(() => {
@@ -1025,6 +1181,13 @@ export default function CanvasWhiteboard() {
       inputRef.current.focus();
     }
   }, [showInput]);
+
+  useEffect(() => {
+    return () => {
+      clearPendingPasteTimeout();
+      cancelLongPress();
+    };
+  }, []);
 
   // 初始化 canvas 尺寸（HiDPI 适配）
   useLayoutEffect(() => {
@@ -1283,6 +1446,18 @@ export default function CanvasWhiteboard() {
   const selectedImageCount = cards.reduce((acc, c) => acc + (selectedIds.has(c.id) && c.type === 'image' ? 1 : 0), 0);
   const selectedTotalCount = selectedIds.size;
 
+  const quickTips = [
+    '单击空白粘贴剪贴板',
+    '双击空白添加文字卡片',
+    '空格 + 拖动拖动画布',
+    'Ctrl + 滚轮调整缩放'
+  ];
+
+  const collapsedTitle = [
+    status === 'authenticated' ? (session?.user?.email || '') : '登录',
+    ...quickTips
+  ].filter(Boolean).join('\n');
+
   const minimapWidth = 200;
   const minimapHeight = 140;
   const hasViewport = viewportSize.width > 0 && viewportSize.height > 0;
@@ -1395,6 +1570,7 @@ export default function CanvasWhiteboard() {
         ref={canvasRef}
         onClick={handleCanvasClick}
         onDoubleClick={handleCanvasDoubleClick}
+        onContextMenu={handleCanvasContextMenu}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -1426,6 +1602,59 @@ export default function CanvasWhiteboard() {
         </div>
       )}
 
+      {contextMenu && (
+        <div
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+          style={{
+            position: 'absolute',
+            left: `${contextMenu.x}px`,
+            top: `${contextMenu.y}px`,
+            transform: 'translate(4px, 4px)',
+            background: 'white',
+            border: '1px solid #d1d5db',
+            borderRadius: 6,
+            boxShadow: '0 10px 24px rgba(15,23,42,0.18)',
+            padding: '6px 0',
+            minWidth: '140px',
+            zIndex: 1100
+          }}
+        >
+          {contextMenu.cardType === 'text' && (
+            <button
+              onClick={() => { void handleContextMenuAction('edit'); }}
+              style={{
+                width: '100%',
+                textAlign: 'left',
+                padding: '8px 16px',
+                background: 'transparent',
+                border: 'none',
+                fontSize: 14,
+                cursor: 'pointer'
+              }}
+            >
+              编辑
+            </button>
+          )}
+          <button
+            onClick={() => { void handleContextMenuAction('delete'); }}
+            style={{
+              width: '100%',
+              textAlign: 'left',
+              padding: '8px 16px',
+              background: 'transparent',
+              border: 'none',
+              fontSize: 14,
+              cursor: 'pointer',
+              color: '#ef4444'
+            }}
+          >
+            删除
+          </button>
+        </div>
+      )}
+
       {/* 输入框 */}
       {showInput && (
         <div style={{
@@ -1450,7 +1679,7 @@ export default function CanvasWhiteboard() {
                 handleCancelInput();
               }
             }}
-            placeholder="输入文字内容..."
+            placeholder={editingCardId ? '编辑文字内容...' : '输入文字内容...'}
             style={{
               width: '100%',
               minHeight: '80px',
@@ -1489,7 +1718,7 @@ export default function CanvasWhiteboard() {
                 fontWeight: '500'
               }}
             >
-              添加 (Ctrl+Enter)
+              {editingCardId ? '保存 (Ctrl+Enter)' : '添加 (Ctrl+Enter)'}
             </button>
           </div>
         </div>
@@ -1614,13 +1843,34 @@ export default function CanvasWhiteboard() {
               >收起</button>
             </div>
           </div>
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f172a', marginBottom: 6 }}>快捷操作</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {quickTips.map((tip) => (
+                <span
+                  key={tip}
+                  style={{
+                    background: '#dbeafe',
+                    color: '#1e3a8a',
+                    padding: '4px 10px',
+                    borderRadius: 999,
+                    fontSize: '12px',
+                    lineHeight: 1.4,
+                    display: 'inline-flex'
+                  }}
+                >
+                  {tip}
+                </span>
+              ))}
+            </div>
+          </div>
           <ul style={{ margin: 0, paddingLeft: '20px' }}>
-            <li>点击空白处粘贴剪贴板（图/文）</li>
-            <li>双击空白处手动添加文字卡片</li>
-            <li>文字卡片：单击选择，双击复制内容</li>
-            <li>图片卡片：单击选择；分享仅分享图片</li>
-            <li>按住空格键拖拽白板，Ctrl + 滚轮缩放</li>
-            <li>登录后，云端多端实时更新</li>
+            <li>单击白板空白区域自动粘贴当前剪贴板的图文内容</li>
+            <li>双击空白打开输入框，Ctrl + Enter 提交文字卡片，Esc 取消</li>
+            <li>单击卡片切换选中，拖动主体或句柄移动/缩放，单击空白清空选择</li>
+            <li>双击文字卡片即可复制内容到剪贴板</li>
+            <li>右上角按钮：分享仅发送选中的图片卡片，删除会移除所有已选卡片</li>
+            <li>右下角小地图可快速定位；登录后卡片会在云端实时同步</li>
           </ul>
           {/* 分享按钮仅在折叠状态下展示 */}
         </div>
@@ -1628,7 +1878,7 @@ export default function CanvasWhiteboard() {
         <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1000 }}>
           <div
             onClick={() => setIsGuideCollapsed(false)}
-            title={status === 'authenticated' ? (session?.user?.email || '') : '登录'}
+            title={collapsedTitle}
             style={{
               background: '#111827',
               color: '#fff',
@@ -1638,14 +1888,14 @@ export default function CanvasWhiteboard() {
               boxShadow: '0 6px 18px rgba(0,0,0,0.15)',
               fontSize: 13,
               cursor: 'pointer',
-              maxWidth: '60vw',
+              maxWidth: '220px',
               whiteSpace: 'nowrap',
               overflow: 'hidden',
               textOverflow: 'ellipsis'
             }}
           >
             {status === 'authenticated' ? (session?.user?.email || '') : '登录'}
-        </div>
+          </div>
           <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
             <button
               onClick={shareSelected}
@@ -1677,6 +1927,24 @@ export default function CanvasWhiteboard() {
                 fontWeight: 500
               }}
             >删除已选 {selectedTotalCount ? `(${selectedTotalCount})` : ''}</button>
+          </div>
+          <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'flex-end' }}>
+            {quickTips.map((tip) => (
+              <span
+                key={tip}
+                style={{
+                  background: '#f1f5f9',
+                  color: '#1f2937',
+                  padding: '4px 10px',
+                  borderRadius: 999,
+                  fontSize: '12px',
+                  lineHeight: 1.4,
+                  display: 'inline-flex'
+                }}
+              >
+                {tip}
+              </span>
+            ))}
           </div>
         </div>
       )}
