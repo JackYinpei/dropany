@@ -5,7 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
 
-const REFRESH_MARGIN_SECONDS = 60; // refresh 1 minute before expiry to avoid race conditions
+const REFRESH_MARGIN_SECONDS = 60; // 快到期前60秒刷新
 
 function ensureSupabaseEnv() {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {

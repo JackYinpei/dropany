@@ -1077,16 +1077,52 @@ export default function CanvasWhiteboard() {
   // 建立 Supabase 连接与实时同步
   useEffect(() => {
     let channel;
+    let isCancelled = false;
+
     const setup = async () => {
       if (!userId || !session?.supabaseAccessToken || !session?.supabaseRefreshToken) return;
+
       const supabase = createBrowserSupabase();
-      const { data, error } = await supabase.auth.setSession({
-        access_token: session.supabaseAccessToken,
-        refresh_token: session.supabaseRefreshToken,
-      });
-      if (error) {
+
+      // 关键修复：在 setSession 之前检查 token 是否即将过期
+      // 如果即将过期，等待 NextAuth 刷新后再重试
+      const expiresAt = session.supabaseExpiresAt;
+      if (expiresAt) {
+        const expiresAtMs = expiresAt * 1000;
+        const now = Date.now();
+        const timeUntilExpiry = expiresAtMs - now;
+
+        // 如果 token 在 30 秒内过期，认为可能已经过期或正在刷新
+        if (timeUntilExpiry < 30000) {
+          console.log('Token expiring soon, waiting for NextAuth to refresh...');
+          return;
+        }
+      }
+
+      try {
+        // setSession 时明确告诉 Supabase 不要自动刷新
+        // 因为 autoRefreshToken 已经在 createBrowserSupabase 中设为 false
+        const { error } = await supabase.auth.setSession({
+          access_token: session.supabaseAccessToken,
+          refresh_token: session.supabaseRefreshToken,
+        });
+
+        if (error) {
+          console.warn('Failed to set Supabase session:', error.message);
+          // 如果是 refresh token 相关错误，触发重新登录
+          if (error.message?.toLowerCase().includes('refresh')) {
+            // 让 NextAuth 处理，不在这里直接 signOut
+            return;
+          }
+          return;
+        }
+
+        if (isCancelled) return;
+      } catch (error) {
+        console.warn('Exception setting Supabase session:', error);
         return;
       }
+
       supabaseRef.current = supabase;
       // 拉取初始数据
       const { data: rows, error: qerr } = await supabase
@@ -1166,6 +1202,7 @@ export default function CanvasWhiteboard() {
     };
     setup();
     return () => {
+      isCancelled = true;
       if (channel && supabaseRef.current) {
         supabaseRef.current.removeChannel(channel);
       }
