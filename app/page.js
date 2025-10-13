@@ -1247,27 +1247,27 @@ export default function CanvasWhiteboard() {
 
       const supabase = createBrowserSupabase();
 
-      // 关键修复：在 setSession 之前检查 token 是否即将过期
-      // 如果即将过期，等待 NextAuth 刷新后再重试
+      // 避免与 NextAuth 的服务端刷新并发：
+      // 在 setSession 之前检测是否临近过期，临近则等待下一次 session 更新再设置。
       const expiresAt = session.supabaseExpiresAt;
       if (expiresAt) {
         const expiresAtMs = expiresAt * 1000;
         const now = Date.now();
         const timeUntilExpiry = expiresAtMs - now;
 
-        // 如果 token 在 30 秒内过期，认为可能已经过期或正在刷新
-        if (timeUntilExpiry < 30000) {
+        // 与 /api/auth 的 REFRESH_MARGIN_SECONDS(=60s) 保持安全间隔，取 90s
+        // 这样可以尽量避免客户端 setSession 与服务端刷新同时使用同一个 refresh_token
+        if (timeUntilExpiry < 90000) {
           console.log('Token expiring soon, waiting for NextAuth to refresh...');
           return;
         }
       }
 
       try {
-        // setSession 时明确告诉 Supabase 不要自动刷新
-        // 因为 autoRefreshToken 已经在 createBrowserSupabase 中设为 false
+        // 仅设置 access_token，不向浏览器 Supabase 客户端暴露 refresh_token，
+        // 避免 supabase-js 在客户端尝试调用 refresh 导致与 NextAuth 的服务端刷新冲突。
         const { error } = await supabase.auth.setSession({
           access_token: session.supabaseAccessToken,
-          refresh_token: session.supabaseRefreshToken,
         });
 
         if (error) {
