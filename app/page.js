@@ -1241,58 +1241,27 @@ export default function CanvasWhiteboard() {
   useEffect(() => {
     let channel;
     let isCancelled = false;
+    let cleanupSupabase = null;
 
     const setup = async () => {
-      if (!userId || !session?.supabaseAccessToken || !session?.supabaseRefreshToken) return;
+      if (!userId || !session?.supabaseAccessToken) return;
 
-      const supabase = createBrowserSupabase();
-
-      // 避免与 NextAuth 的服务端刷新并发：
-      // 在 setSession 之前检测是否临近过期，临近则等待下一次 session 更新再设置。
-      const expiresAt = session.supabaseExpiresAt;
-      if (expiresAt) {
-        const expiresAtMs = expiresAt * 1000;
-        const now = Date.now();
-        const timeUntilExpiry = expiresAtMs - now;
-
-        // 与 /api/auth 的 REFRESH_MARGIN_SECONDS(=60s) 保持安全间隔，取 90s
-        // 这样可以尽量避免客户端 setSession 与服务端刷新同时使用同一个 refresh_token
-        if (timeUntilExpiry < 90000) {
-          console.log('Token expiring soon, waiting for NextAuth to refresh...');
-          return;
-        }
-      }
-
-      try {
-        // 仅设置 access_token，不向浏览器 Supabase 客户端暴露 refresh_token，
-        // 避免 supabase-js 在客户端尝试调用 refresh 导致与 NextAuth 的服务端刷新冲突。
-        const { error } = await supabase.auth.setSession({
-          access_token: session.supabaseAccessToken,
-        });
-
-        if (error) {
-          console.warn('Failed to set Supabase session:', error.message);
-          // 如果是 refresh token 相关错误，触发重新登录
-          if (error.message?.toLowerCase().includes('refresh')) {
-            // 让 NextAuth 处理，不在这里直接 signOut
-            return;
-          }
-          return;
-        }
-
-        if (isCancelled) return;
-      } catch (error) {
-        console.warn('Exception setting Supabase session:', error);
-        return;
-      }
-
+      // 将当前 access token 直接注入 Supabase 客户端，避免浏览器端接触 refresh token。
+      const supabase = createBrowserSupabase(() => session.supabaseAccessToken);
       supabaseRef.current = supabase;
+      cleanupSupabase = supabase;
+
+      if (isCancelled) return;
+
       // 拉取初始数据
       const { data: rows, error: qerr } = await supabase
         .from('cards')
         .select('*')
         .eq('user_id', userId)
         .order('updated_at', { ascending: true });
+
+      if (isCancelled) return;
+
       if (!qerr && Array.isArray(rows)) {
         const list = rows.map(r => fromRow(r));
         setCards(list);
@@ -1322,6 +1291,8 @@ export default function CanvasWhiteboard() {
         }
       } else if (qerr) {
       }
+
+      if (isCancelled) return;
 
       // 订阅实时变更
       channel = supabase
@@ -1366,11 +1337,14 @@ export default function CanvasWhiteboard() {
     setup();
     return () => {
       isCancelled = true;
-      if (channel && supabaseRef.current) {
-        supabaseRef.current.removeChannel(channel);
+      if (channel && cleanupSupabase) {
+        cleanupSupabase.removeChannel(channel);
+      }
+      if (cleanupSupabase && supabaseRef.current === cleanupSupabase) {
+        supabaseRef.current = null;
       }
     };
-  }, [userId, session?.supabaseAccessToken, session?.supabaseRefreshToken]);
+  }, [userId, session?.supabaseAccessToken]);
 
   // 工具：保存卡片（去抖）与转换
   const toRow = (card) => ({
