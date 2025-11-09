@@ -27,6 +27,7 @@ export function TextInputOverlay({
         minWidth: '320px',
         border: '1px solid rgba(148,163,184,0.25)',
         zIndex: 1200,
+        color: '#0f172a',
       }}
       onClick={(e) => e.stopPropagation()}
     >
@@ -46,6 +47,8 @@ export function TextInputOverlay({
           resize: 'vertical',
           outline: 'none',
           boxShadow: 'inset 0 1px 2px rgba(15,23,42,0.08)',
+          color: '#0f172a',
+          backgroundColor: '#ffffff',
         }}
         onKeyDown={(e) => {
           if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {

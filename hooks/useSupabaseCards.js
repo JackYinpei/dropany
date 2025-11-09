@@ -8,6 +8,7 @@ export function useSupabaseCards({ userId, accessToken }) {
   const [cards, setCards] = useState([]);
   const supabaseRef = useRef(null);
   const saveTimersRef = useRef(new Map());
+  const pendingCardsRef = useRef(new Map());
 
   const toRow = useCallback(
     (card) => ({
@@ -53,8 +54,14 @@ export function useSupabaseCards({ userId, accessToken }) {
       saveTimersRef.current.forEach(clearTimeout);
       saveTimersRef.current.clear();
 
-      if (!userId || !accessToken) {
+      if (!userId) {
         setCards([]);
+        supabaseRef.current = null;
+        pendingCardsRef.current.clear();
+        return;
+      }
+
+      if (!accessToken) {
         supabaseRef.current = null;
         return;
       }
@@ -76,7 +83,24 @@ export function useSupabaseCards({ userId, accessToken }) {
 
       if (!disposed) {
         if (!error && Array.isArray(data)) {
-          setCards(data.map(fromRow));
+          setCards((prev) => {
+            const merged = new Map();
+            data.map(fromRow).forEach((card) => {
+              merged.set(String(card.id), card);
+            });
+            pendingCardsRef.current.forEach((card, id) => {
+              if (!merged.has(id)) {
+                merged.set(id, card);
+              }
+            });
+            prev.forEach((card) => {
+              const id = String(card.id);
+              if (!merged.has(id)) {
+                merged.set(id, card);
+              }
+            });
+            return Array.from(merged.values());
+          });
         } else if (error) {
           console.warn("Failed to load cards:", error.message);
         }
@@ -134,13 +158,21 @@ export function useSupabaseCards({ userId, accessToken }) {
 
   const scheduleSave = useCallback(
     (card) => {
-      if (!userId || !supabaseRef.current) return;
+      if (!card?.id) return;
       const id = String(card.id);
+      pendingCardsRef.current.set(id, { ...card });
       const timers = saveTimersRef.current;
-      if (timers.has(id)) clearTimeout(timers.get(id));
+      if (timers.has(id)) {
+        clearTimeout(timers.get(id));
+        timers.delete(id);
+      }
+      if (!userId || !supabaseRef.current) return;
       const handle = setTimeout(async () => {
         try {
-          await supabaseRef.current.from("cards").upsert([toRow(card)], { onConflict: "id" });
+          await supabaseRef.current
+            .from("cards")
+            .upsert([toRow(card)], { onConflict: "id" });
+          pendingCardsRef.current.delete(id);
         } catch (err) {
           console.warn("Failed to upsert card:", err);
         }
@@ -158,6 +190,15 @@ export function useSupabaseCards({ userId, accessToken }) {
       } catch (err) {
         console.warn("Failed to delete cards:", err);
       }
+      const timers = saveTimersRef.current;
+      ids.forEach((id) => {
+        const key = String(id);
+        if (timers.has(key)) {
+          clearTimeout(timers.get(key));
+          timers.delete(key);
+        }
+        pendingCardsRef.current.delete(key);
+      });
     },
     [userId]
   );
@@ -189,6 +230,35 @@ export function useSupabaseCards({ userId, accessToken }) {
     },
     [userId]
   );
+
+  useEffect(() => {
+    const client = supabaseRef.current;
+    if (!userId || !accessToken || !client) return;
+    if (!pendingCardsRef.current.size) return;
+
+    let cancelled = false;
+    const flushPending = async () => {
+      const entries = Array.from(pendingCardsRef.current.entries());
+      if (!entries.length) return;
+      try {
+        if (!supabaseRef.current || supabaseRef.current !== client) return;
+        await client
+          .from("cards")
+          .upsert(entries.map(([, card]) => toRow(card)), { onConflict: "id" });
+        if (!cancelled) {
+          entries.forEach(([id]) => pendingCardsRef.current.delete(id));
+        }
+      } catch (err) {
+        console.warn("Failed to flush pending cards:", err);
+      }
+    };
+
+    flushPending();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, accessToken, toRow]);
 
   return {
     cards,
