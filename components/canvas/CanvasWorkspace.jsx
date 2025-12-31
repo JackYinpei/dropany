@@ -77,6 +77,43 @@ export default function CanvasWorkspace({
     setTimeout(() => setHint(null), 900);
   }, []);
 
+  const getCardImageBlob = useCallback(async (card) => {
+    if (!card || card.type !== 'image' || !card.src) return null;
+    try {
+      if (userId && supabaseReady && !/^https?:|^blob:|^data:/.test(card.src)) {
+        const { data, error } = await createSignedUrl(card.src, 300);
+        if (!error && data?.signedUrl) {
+          const res = await fetch(data.signedUrl);
+          if (res.ok) {
+            const blob = await res.blob();
+            if (blob.type.startsWith('image/')) return blob;
+          }
+        }
+      }
+
+      try {
+        const res = await fetch(card.src);
+        if (res.ok) {
+          const blob = await res.blob();
+          if (blob.type.startsWith('image/')) return blob;
+        }
+      } catch {}
+
+      const img = imageCacheRef.current.get(card.src);
+      if (img && (img.naturalWidth || img.width) && (img.naturalHeight || img.height)) {
+        const c = document.createElement('canvas');
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        c.width = w; c.height = h;
+        const ctx2 = c.getContext('2d');
+        ctx2.drawImage(img, 0, 0, w, h);
+        const blob = await new Promise(resolve => c.toBlob(resolve, 'image/png', 0.92));
+        return blob;
+      }
+    } catch {}
+    return null;
+  }, [createSignedUrl, supabaseReady, userId]);
+
   
 
   // 批量分享已选图片
@@ -96,35 +133,7 @@ export default function CanvasWorkspace({
         showHint('仅支持分享图片', 24, 24, 'info');
         return;
       }
-      const blobs = await Promise.all(imgs.map(async (card) => {
-        let blob = null;
-        try {
-          if (userId && supabaseReady && card.src && !/^https?:|^blob:|^data:/.test(card.src)) {
-            const { data, error } = await createSignedUrl(card.src, 3600);
-            if (!error && data?.signedUrl) {
-              const res = await fetch(data.signedUrl);
-              blob = await res.blob();
-            }
-          }
-          if (!blob && card.src) {
-            try {
-              const res = await fetch(card.src);
-              blob = await res.blob();
-            } catch {}
-          }
-          if (!blob) {
-            const img = imageCacheRef.current.get(card.src);
-            if (img && img.naturalWidth && img.naturalHeight) {
-              const c = document.createElement('canvas');
-              c.width = img.naturalWidth; c.height = img.naturalHeight;
-              const ctx2 = c.getContext('2d');
-              ctx2.drawImage(img, 0, 0);
-              blob = await new Promise(resolve => c.toBlob(b => resolve(b), 'image/png', 0.92));
-            }
-          }
-        } catch {}
-        return blob;
-      }));
+      const blobs = await Promise.all(imgs.map(card => getCardImageBlob(card)));
       const files = blobs.filter(Boolean).map((blob, idx) => new File([blob], `image-${idx + 1}.png`, { type: blob.type || 'image/png' }));
       if (!files.length) {
         showHint('未能获取到图片数据', 24, 24, 'error');
@@ -138,7 +147,7 @@ export default function CanvasWorkspace({
     } catch {
       showHint('分享失败', 24, 24, 'error');
     }
-  }, [cards, selectedIds, userId, showHint, supabaseReady, createSignedUrl]);
+  }, [cards, selectedIds, showHint, getCardImageBlob]);
 
   // 批量删除已选（文本与图片）
   const deleteSelected = useCallback(async () => {
@@ -480,7 +489,25 @@ export default function CanvasWorkspace({
             await navigator.clipboard.writeText(clickedCard.text || '');
             showHint('已复制', clickX, clickY, 'success');
           }
-        } catch {}
+        } catch {
+          showHint('复制失败', clickX, clickY, 'error');
+        }
+      } else if (clickedCard.type === 'image') {
+        try {
+          if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.write && typeof ClipboardItem !== 'undefined') {
+            const blob = await getCardImageBlob(clickedCard);
+            if (!blob) {
+              showHint('未能获取到图片数据', clickX, clickY, 'error');
+              return;
+            }
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'image/png']: blob })]);
+            showHint('已复制', clickX, clickY, 'success');
+          } else {
+            showHint('该浏览器不支持复制图片', clickX, clickY, 'info');
+          }
+        } catch {
+          showHint('复制失败', clickX, clickY, 'error');
+        }
       }
       return;
     }
